@@ -1,11 +1,669 @@
+// server.js — webcamgo-control-api
+//
+// Obiettivo: API “di controllo” per Facile (snapshot realtime, reboot, PTZ)
+// Nota: questo file è pensato per girare *dentro* webcamgo-1 (VPN già disponibile sul nodo/host).
+//
+// Dipendenze attese (package.json):
+// - express
+// - cors
+// - undici
+// - onvif
+//
+// Env:
+// - PORT=3000
+// - CONTROL_API_KEY=...   (richiesta in header: x-api-key)
+// - CONTROL_API_ALLOW_ORIGINS=* (opzionale, default "*")
+
+'use strict'
+
 const express = require('express')
+const cors = require('cors')
+const crypto = require('crypto')
+const {Cam} = require('onvif')
+const {fetch} = require('undici')
 
 const app = express()
-app.use(express.json())
+app.use(express.json({limit: '2mb'}))
 
-app.get('/health', (req, res) => {
+/* ──────────────────────────────────────────────
+ * CORS (semplice)
+ * ────────────────────────────────────────────── */
+const allowOrigins = process.env.CONTROL_API_ALLOW_ORIGINS || '*'
+app.use(
+  cors({
+    origin: allowOrigins === '*' ? true : allowOrigins.split(',').map(s => s.trim()),
+    credentials: true,
+  })
+)
+
+/* ──────────────────────────────────────────────
+ * API KEY middleware
+ * - consuma header: x-api-key
+ * - lascia libero /v1/health
+ * ────────────────────────────────────────────── */
+function requireApiKey(req, res, next) {
+  if (req.path === '/v1/health') return next()
+
+  const required = process.env.CONTROL_API_KEY
+  if (!required) {
+    // se non impostata, NON blocchiamo (ma è meglio impostarla!)
+    return next()
+  }
+  const provided = req.header('x-api-key')
+  if (!provided || provided !== required) {
+    return res.status(401).json({ok: false, error: 'unauthorized'})
+  }
+  next()
+}
+app.use(requireApiKey)
+
+/* ──────────────────────────────────────────────
+ * Utils
+ * ────────────────────────────────────────────── */
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+
+function withTimeout(ms, fn) {
+  const controller = new AbortController()
+  const t = setTimeout(() => controller.abort(new Error('timeout')), ms)
+  return fn(controller.signal).finally(() => clearTimeout(t))
+}
+
+function normalizeBaseUrl(baseUrl, port) {
+  // baseUrl può arrivare come:
+  // - "172.29.0.10"
+  // - "http://172.29.0.10"
+  // - "http://172.29.0.10:80"
+  const hasProto = /^https?:\/\//i.test(baseUrl)
+  const url = new URL(hasProto ? baseUrl : `http://${baseUrl}`)
+  if (port) url.port = String(port)
+  return url.toString().replace(/\/+$/, '')
+}
+
+function toBasicAuthHeader(user, pass) {
+  return 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64')
+}
+
+function looksLikeDigestChallenge(wwwAuth) {
+  return typeof wwwAuth === 'string' && /^digest/i.test(wwwAuth.trim())
+}
+
+function parseDigestChallenge(header) {
+  // Esempio: Digest realm="...", nonce="...", qop="auth", opaque="..."
+  const params = Object.fromEntries(
+    [...header.matchAll(/(\w+)=("([^"]+)"|([^,]+))/g)].map(([_, k, __, qval, val]) => [
+      k.toLowerCase(),
+      qval || val,
+    ])
+  )
+  return params
+}
+
+function md5(s) {
+  return crypto.createHash('md5').update(s).digest('hex')
+}
+
+function buildDigestAuthHeader({method, url, user, pass, challenge, nc = '00000001'}) {
+  const u = new URL(url)
+  const uri = u.pathname + (u.search || '')
+  const realm = challenge.realm || ''
+  const nonce = challenge.nonce || ''
+  const qopRaw = challenge.qop || ''
+  const qop = /\bauth\b/i.test(qopRaw) ? 'auth' : qopRaw.split(',')[0] || null
+  const algorithm = (challenge.algorithm || 'MD5').toUpperCase()
+  const opaque = challenge.opaque
+
+  if (algorithm !== 'MD5') {
+    // per ora supportiamo MD5 (quasi tutte le cam fanno così)
+    // se capiterà MD5-sess, si estende.
+  }
+
+  const ha1 = md5(`${user}:${realm}:${pass}`)
+  const ha2 = md5(`${method.toUpperCase()}:${uri}`)
+
+  let response
+  let extra = ''
+  const cnonce = crypto.randomBytes(8).toString('hex')
+
+  if (qop) {
+    response = md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`)
+    extra = `, qop=${qop}, nc=${nc}, cnonce="${cnonce}"`
+  } else {
+    response = md5(`${ha1}:${nonce}:${ha2}`)
+  }
+
+  const opaquePart = opaque ? `, opaque="${opaque}"` : ''
+  return (
+    `Digest username="${user}", realm="${realm}", nonce="${nonce}", uri="${uri}", ` +
+    `response="${response}", algorithm=${algorithm}` +
+    extra +
+    opaquePart
+  )
+}
+
+async function fetchWithBasicOrDigest(
+  url,
+  {method = 'GET', user, pass, headers = {}, body, timeoutMs = 8000} = {}
+) {
+  // 1) prova preemptive Basic (molte cam accettano)
+  // 2) se 401 con Digest challenge -> retry Digest
+  // 3) se 401 con Basic challenge -> retry Basic (non-preemptive ma uguale)
+  return withTimeout(timeoutMs, async signal => {
+    const commonHeaders = {
+      'User-Agent': 'webcamgo-control-api',
+      ...headers,
+    }
+
+    // Tentativo 1: Basic preemptive
+    let r = await fetch(url, {
+      method,
+      signal,
+      headers: {
+        ...commonHeaders,
+        ...(user && pass ? {Authorization: toBasicAuthHeader(user, pass)} : {}),
+      },
+      body,
+    })
+
+    if (r.status !== 401) return r
+
+    const wwwAuth = r.headers.get('www-authenticate') || ''
+    if (looksLikeDigestChallenge(wwwAuth) && user && pass) {
+      const challenge = parseDigestChallenge(wwwAuth)
+      const auth = buildDigestAuthHeader({method, url, user, pass, challenge})
+      r = await fetch(url, {
+        method,
+        signal,
+        headers: {...commonHeaders, Authorization: auth},
+        body,
+      })
+      return r
+    }
+
+    // fallback: se basic richiesto
+    if (/^basic/i.test(wwwAuth) && user && pass) {
+      r = await fetch(url, {
+        method,
+        signal,
+        headers: {...commonHeaders, Authorization: toBasicAuthHeader(user, pass)},
+        body,
+      })
+      return r
+    }
+
+    return r
+  })
+}
+
+async function connectOnvif({ip, port = 80, user, pass, timeoutMs = 9000}) {
+  return withTimeout(timeoutMs, async () => {
+    return new Promise((resolve, reject) => {
+      new Cam(
+        {
+          hostname: ip,
+          port: parseInt(port, 10),
+          username: user,
+          password: pass,
+        },
+        function (err) {
+          if (err) return reject(err)
+          resolve(this)
+        }
+      )
+    })
+  })
+}
+
+async function getFirstProfileToken(cam) {
+  const profiles = await new Promise((resolve, reject) =>
+    cam.getProfiles((err, result) => (err ? reject(err) : resolve(result)))
+  )
+  const token = profiles?.[0]?.$?.token || profiles?.[0]?.token
+  if (!token) throw new Error('ProfileToken assente')
+  return token
+}
+
+/* ──────────────────────────────────────────────
+ * HEALTH
+ * ────────────────────────────────────────────── */
+app.get('/v1/health', (req, res) => {
   res.json({ok: true, service: 'webcamgo-control-api'})
 })
 
+/* ──────────────────────────────────────────────
+ * SNAPSHOT (realtime)
+ *
+ * Modalità supportate:
+ * A) GET /v1/webcams/:id/snapshot?url=http://...  (+ user/pass)
+ * B) GET /v1/webcams/:id/snapshot?ip=172.29.0.10&port=80&user=...&pass=...
+ *    → prova ONVIF getSnapshotUri e poi scarica la JPEG
+ *
+ * Risposta:
+ * - 200 image/jpeg (stream)
+ * - oppure JSON errore
+ * ────────────────────────────────────────────── */
+app.get('/v1/webcams/:id/snapshot', async (req, res) => {
+  try {
+    const {url, ip, port, user, pass} = req.query
+
+    // Se arriva un URL esplicito, usiamo quello
+    let snapshotUrl = url ? String(url) : null
+
+    // Altrimenti proviamo ONVIF per ottenere snapshotUri
+    if (!snapshotUrl) {
+      if (!ip || !user || !pass) {
+        return res.status(400).json({
+          ok: false,
+          error: 'bad_request',
+          message: 'Richiesti: url oppure (ip,user,pass).',
+        })
+      }
+
+      const cam = await connectOnvif({
+        ip: String(ip),
+        port: port ? +port : 80,
+        user: String(user),
+        pass: String(pass),
+      })
+      const uri = await new Promise((resolve, reject) =>
+        cam.getSnapshotUri((err, data) =>
+          err ? reject(err) : resolve(data?.uri || data?.Uri || null)
+        )
+      )
+      if (!uri) throw new Error('URI snapshot non ricevuta via ONVIF')
+      snapshotUrl = String(uri)
+    }
+
+    // Cache-buster per “realtime”
+    const u = new URL(/^https?:\/\//i.test(snapshotUrl) ? snapshotUrl : `http://${snapshotUrl}`)
+    u.searchParams.set('_ts', Date.now().toString())
+    const cacheBusted = u.toString()
+
+    const r = await fetchWithBasicOrDigest(cacheBusted, {
+      method: 'GET',
+      user: user ? String(user) : undefined,
+      pass: pass ? String(pass) : undefined,
+      timeoutMs: 10000,
+      headers: {
+        'Accept': 'image/jpeg',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+      },
+    })
+
+    if (!r.ok) {
+      const text = await r.text().catch(() => '')
+      return res.status(502).json({
+        ok: false,
+        error: 'snapshot_failed',
+        status: r.status,
+        detail: text?.slice(0, 300) || r.statusText,
+      })
+    }
+
+    const ct = r.headers.get('content-type') || ''
+    if (!/image\/jpeg/i.test(ct) && !/image\//i.test(ct)) {
+      // alcune cam non mettono content-type: proviamo comunque
+    }
+
+    res.setHeader('Content-Type', 'image/jpeg')
+    res.setHeader('Cache-Control', 'no-store')
+    const buf = Buffer.from(await r.arrayBuffer())
+    return res.status(200).send(buf)
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: 'snapshot_error',
+      message: e?.message || String(e),
+    })
+  }
+})
+
+/* ──────────────────────────────────────────────
+ * REBOOT
+ *
+ * POST /v1/webcams/:id/reboot
+ * Body:
+ * {
+ *   "ip": "172.29.0.10",
+ *   "port": 80,
+ *   "user": "...",
+ *   "pass": "...",
+ *   "brand": "hikvision|dahua|..." (opzionale),
+ *   "mode": "onvif|hikvision_isapi|dahua_cgi" (opzionale)
+ * }
+ * ────────────────────────────────────────────── */
+app.post('/v1/webcams/:id/reboot', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass, brand = '', mode = ''} = req.body || {}
+    if (!ip || !user || !pass) {
+      return res
+        .status(400)
+        .json({ok: false, error: 'bad_request', message: 'ip,user,pass obbligatori'})
+    }
+
+    const b = String(brand).toLowerCase()
+    const m = String(mode).toLowerCase()
+
+    // Hikvision ISAPI reboot (spesso Basic o Digest; qui proviamo Basic preemptive e poi Digest se serve)
+    if (m === 'hikvision_isapi' || b.includes('hikvision')) {
+      const base = normalizeBaseUrl(String(ip), port)
+      const url = `${base}/ISAPI/System/reboot`
+      const body = '<SystemReboot><reboot>true</reboot></SystemReboot>'
+
+      const r = await fetchWithBasicOrDigest(url, {
+        method: 'PUT',
+        user: String(user),
+        pass: String(pass),
+        timeoutMs: 9000,
+        headers: {'Content-Type': 'application/xml', 'Accept': 'application/xml'},
+        body,
+      })
+
+      if (!r.ok) {
+        const text = await r.text().catch(() => '')
+        return res
+          .status(502)
+          .json({ok: false, error: 'reboot_failed', status: r.status, detail: text?.slice(0, 300)})
+      }
+
+      return res.json({ok: true, via: 'hikvision_isapi'})
+    }
+
+    // Dahua CGI reboot (se serve)
+    if (m === 'dahua_cgi' || b.includes('dahua')) {
+      const base = normalizeBaseUrl(String(ip), port)
+      // Nota: endpoint reboot Dahua può variare; questo è un “comune”
+      // Se nel tuo parco usate un path diverso, lo adattiamo.
+      const url = `${base}/cgi-bin/magicBox.cgi?action=reboot`
+
+      const r = await fetchWithBasicOrDigest(url, {
+        method: 'GET',
+        user: String(user),
+        pass: String(pass),
+        timeoutMs: 9000,
+        headers: {Accept: 'text/plain'},
+      })
+
+      if (!r.ok) {
+        const text = await r.text().catch(() => '')
+        return res
+          .status(502)
+          .json({ok: false, error: 'reboot_failed', status: r.status, detail: text?.slice(0, 300)})
+      }
+
+      return res.json({ok: true, via: 'dahua_cgi'})
+    }
+
+    // Default: ONVIF systemReboot
+    const cam = await connectOnvif({
+      ip: String(ip),
+      port: +port,
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 9000,
+    })
+    await withTimeout(9000, async () => {
+      return new Promise((resolve, reject) =>
+        cam.systemReboot(err => (err ? reject(err) : resolve()))
+      )
+    })
+
+    return res.json({ok: true, via: 'onvif'})
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ok: false, error: 'reboot_error', message: e?.message || String(e)})
+  }
+})
+
+/* ──────────────────────────────────────────────
+ * PTZ
+ *
+ * POST /v1/webcams/:id/ptz
+ * Body:
+ * {
+ *   "ip": "172.29.0.10",
+ *   "port": 80,
+ *   "user": "...",
+ *   "pass": "...",
+ *   "brand": "dahua|hikvision|...",
+ *   "mode": "onvif|dahua_cgi|hikvision_isapi" (opzionale),
+ *   "command": "left|right|up|down|zoom_in|zoom_out|stop|goto_preset",
+ *   "speed": 0.5,              // 0..1 (onvif) | 1..8 (dahua cgi)
+ *   "durationMs": 200,         // per start/stop automatico
+ *   "presetToken": "3"         // per goto_preset
+ * }
+ * ────────────────────────────────────────────── */
+app.post('/v1/webcams/:id/ptz', async (req, res) => {
+  try {
+    const {
+      ip,
+      port = 80,
+      user,
+      pass,
+      brand = '',
+      mode = '',
+      command,
+      speed = 0.5,
+      durationMs = 200,
+      presetToken,
+      channel = 1, // per Dahua CGI spesso 1 sui dome
+    } = req.body || {}
+
+    if (!ip || !user || !pass || !command) {
+      return res.status(400).json({
+        ok: false,
+        error: 'bad_request',
+        message: 'ip,user,pass,command obbligatori',
+      })
+    }
+
+    const b = String(brand).toLowerCase()
+    const m = String(mode).toLowerCase()
+    const cmd = String(command).toLowerCase()
+
+    // ── Dahua CGI PTZ (start + stop automatico)
+    if (m === 'dahua_cgi' || b.includes('dahua')) {
+      const base = normalizeBaseUrl(String(ip), port)
+
+      const dahuaCodeByCommand = {
+        left: 'Left',
+        right: 'Right',
+        up: 'Up',
+        down: 'Down',
+        zoom_in: 'ZoomTele',
+        zoom_out: 'ZoomWide',
+        goto_preset: 'GotoPreset',
+      }
+
+      if (cmd === 'stop') {
+        // Stop generico: su Dahua si fa chiamando ptz.cgi?action=stop con stesso code
+        // Qui usiamo "Left" come placeholder (alcuni firmware lo ignorano e stoppa comunque).
+        const stopUrl = `${base}/cgi-bin/ptz.cgi?action=stop&channel=${channel}&code=Left&arg1=0&arg2=0&arg3=0`
+        const r = await fetchWithBasicOrDigest(stopUrl, {user, pass, timeoutMs: 7000})
+        if (!r.ok) return res.status(502).json({ok: false, error: 'ptz_failed', status: r.status})
+        return res.json({ok: true, via: 'dahua_cgi', command: 'stop'})
+      }
+
+      const code = dahuaCodeByCommand[cmd]
+      if (!code) {
+        return res
+          .status(400)
+          .json({ok: false, error: 'bad_request', message: 'command non supportato per dahua_cgi'})
+      }
+
+      const sp = Math.max(1, Math.min(8, Math.round(Number(speed) * 8 || 4))) // 1..8
+      const isZoom = code === 'ZoomTele' || code === 'ZoomWide'
+
+      let arg1 = 0,
+        arg2 = isZoom ? sp : 0,
+        arg3 = isZoom ? 0 : sp
+
+      if (cmd === 'goto_preset') {
+        if (presetToken == null) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error: 'bad_request',
+              message: 'presetToken obbligatorio per goto_preset',
+            })
+        }
+        // Da esperienze comuni Dahua: preset in arg3
+        arg1 = 0
+        arg2 = 0
+        arg3 = presetToken
+      }
+
+      const startUrl =
+        `${base}/cgi-bin/ptz.cgi?action=start` +
+        `&channel=${channel}&code=${encodeURIComponent(code)}` +
+        `&arg1=${encodeURIComponent(arg1)}&arg2=${encodeURIComponent(arg2)}&arg3=${encodeURIComponent(arg3)}`
+
+      const stopUrl = startUrl.replace('action=start', 'action=stop')
+
+      const r1 = await fetchWithBasicOrDigest(startUrl, {user, pass, timeoutMs: 7000})
+      if (!r1.ok) {
+        const text = await r1.text().catch(() => '')
+        return res
+          .status(502)
+          .json({ok: false, error: 'ptz_failed', status: r1.status, detail: text?.slice(0, 300)})
+      }
+
+      // stop automatico (non per goto_preset, dove spesso non serve)
+      if (cmd !== 'goto_preset') {
+        setTimeout(
+          () => {
+            fetchWithBasicOrDigest(stopUrl, {user, pass, timeoutMs: 7000}).catch(() => {})
+          },
+          Math.max(50, Math.min(2000, Number(durationMs) || 200))
+        )
+      }
+
+      return res.json({ok: true, via: 'dahua_cgi', command: cmd})
+    }
+
+    // ── ONVIF PTZ (relativeMove / stop / gotoPreset)
+    const cam = await connectOnvif({
+      ip: String(ip),
+      port: +port,
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 9000,
+    })
+    const profileToken = await getFirstProfileToken(cam)
+
+    if (cmd === 'stop') {
+      await new Promise((resolve, reject) =>
+        cam.stop({profileToken, panTilt: true, zoom: true}, err => (err ? reject(err) : resolve()))
+      )
+      return res.json({ok: true, via: 'onvif', command: 'stop'})
+    }
+
+    if (cmd === 'goto_preset') {
+      if (presetToken == null) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error: 'bad_request',
+            message: 'presetToken obbligatorio per goto_preset',
+          })
+      }
+      await new Promise((resolve, reject) =>
+        cam.gotoPreset({profileToken, presetToken: String(presetToken)}, err =>
+          err ? reject(err) : resolve()
+        )
+      )
+      return res.json({
+        ok: true,
+        via: 'onvif',
+        command: 'goto_preset',
+        presetToken: String(presetToken),
+      })
+    }
+
+    // relativeMove: translation normalizzata -1..1
+    const s = Math.max(0.05, Math.min(1, Number(speed) || 0.5))
+    const translation = {}
+
+    if (cmd === 'left') translation.x = -s
+    else if (cmd === 'right') translation.x = s
+    else if (cmd === 'up') translation.y = s
+    else if (cmd === 'down') translation.y = -s
+    else if (cmd === 'zoom_in') translation.zoom = s
+    else if (cmd === 'zoom_out') translation.zoom = -s
+    else {
+      return res
+        .status(400)
+        .json({ok: false, error: 'bad_request', message: 'command non supportato'})
+    }
+
+    await new Promise((resolve, reject) =>
+      cam.relativeMove({profileToken, translation}, err => (err ? reject(err) : resolve()))
+    )
+
+    // stop automatico
+    await sleep(Math.max(50, Math.min(2000, Number(durationMs) || 200)))
+    await new Promise((resolve, reject) =>
+      cam.stop({profileToken, panTilt: true, zoom: true}, err => (err ? reject(err) : resolve()))
+    )
+
+    return res.json({ok: true, via: 'onvif', command: cmd})
+  } catch (e) {
+    return res.status(500).json({ok: false, error: 'ptz_error', message: e?.message || String(e)})
+  }
+})
+
+/* ──────────────────────────────────────────────
+ * (Opzionale) CGI “pass-through” controllato
+ * Utile per comandi noti, senza esporre path libero.
+ *
+ * POST /v1/webcams/:id/cgi
+ * Body: { "ip":"...", "port":80, "user":"...", "pass":"...", "path":"/cgi-bin/..." }
+ *
+ * IMPORTANTE: qui blocchiamo path per evitare abusi.
+ * ────────────────────────────────────────────── */
+app.post('/v1/webcams/:id/cgi', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass, path} = req.body || {}
+    if (!ip || !user || !pass || !path) {
+      return res
+        .status(400)
+        .json({ok: false, error: 'bad_request', message: 'ip,user,pass,path obbligatori'})
+    }
+
+    const p = String(path)
+    // allowlist minima: solo /cgi-bin/
+    if (!p.startsWith('/cgi-bin/')) {
+      return res.status(400).json({ok: false, error: 'bad_request', message: 'path non consentito'})
+    }
+
+    const base = normalizeBaseUrl(String(ip), port)
+    const url = `${base}${p}`
+
+    const r = await fetchWithBasicOrDigest(url, {
+      method: 'GET',
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 8000,
+    })
+    const text = await r.text().catch(() => '')
+
+    if (!r.ok) {
+      return res
+        .status(502)
+        .json({ok: false, error: 'cgi_failed', status: r.status, detail: text?.slice(0, 300)})
+    }
+
+    return res.json({ok: true, raw: text})
+  } catch (e) {
+    return res.status(500).json({ok: false, error: 'cgi_error', message: e?.message || String(e)})
+  }
+})
+
+/* ────────────────────────────────────────────── */
 const port = process.env.PORT || 3000
-app.listen(port, () => console.log(`Listening on ${port}`))
+app.listen(port, () => {
+  console.log('webcamgo-control-api listening on', port)
+})
