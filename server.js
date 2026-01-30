@@ -927,6 +927,67 @@ app.post('/v1/webcams/:id/onvif/presets/goto', async (req, res) => {
   }
 })
 
+app.post('/v1/webcams/:id/onvif/device-info', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass} = req.body || {}
+    if (!ip || !user || !pass) {
+      return res
+        .status(400)
+        .json({ok: false, error: 'bad_request', message: 'ip,user,pass obbligatori'})
+    }
+
+    const cam = await connectOnvif({
+      ip: String(ip),
+      port: +port,
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 9000,
+    })
+
+    // Device Information
+    const info = await new Promise((resolve, reject) =>
+      cam.getDeviceInformation((err, result) => (err ? reject(err) : resolve(result)))
+    )
+
+    // ONVIF version (best-effort): GetServices(true) se disponibile
+    let onvifVersion = null
+    try {
+      const services = await new Promise((resolve, reject) =>
+        cam.getServices({includeCapability: true}, (err, result) =>
+          err ? reject(err) : resolve(result)
+        )
+      )
+
+      // alcuni device ritornano "Version" con Major/Minor
+      const devMgmt = (services || []).find(s => {
+        const ns = (s?.Namespace || s?.namespace || '').toString().toLowerCase()
+        return ns.includes('device/wsdl') || ns.includes('devicemgmt')
+      })
+      const v = devMgmt?.Version || devMgmt?.version
+      if (v && (v?.Major != null || v?.Minor != null)) {
+        onvifVersion = `${v.Major ?? v.major}.${v.Minor ?? v.minor}`
+      }
+    } catch (_) {
+      // ok: non tutte le cam supportano bene getServices
+    }
+
+    return res.json({
+      ok: true,
+      model_number: info?.Model ?? info?.model ?? null,
+      firmware_version: info?.FirmwareVersion ?? info?.firmwareVersion ?? null,
+      serial_number: info?.SerialNumber ?? info?.serialNumber ?? null,
+      onvif_version: onvifVersion,
+      raw: info || null,
+    })
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: 'onvif_device_info_error',
+      message: e?.message || String(e),
+    })
+  }
+})
+
 /* ────────────────────────────────────────────── */
 const port = process.env.PORT || 3000
 app.listen(port, () => {
