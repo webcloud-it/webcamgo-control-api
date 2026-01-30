@@ -1,19 +1,3 @@
-// server.js — webcamgo-control-api
-//
-// Obiettivo: API “di controllo” per Facile (snapshot realtime, reboot, PTZ)
-// Nota: questo file è pensato per girare *dentro* webcamgo-1 (VPN già disponibile sul nodo/host).
-//
-// Dipendenze attese (package.json):
-// - express
-// - cors
-// - undici
-// - onvif
-//
-// Env:
-// - PORT=3000
-// - CONTROL_API_KEY=...   (richiesta in header: x-api-key)
-// - CONTROL_API_ALLOW_ORIGINS=* (opzionale, default "*")
-
 'use strict'
 
 const express = require('express')
@@ -501,13 +485,11 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
 
       if (cmd === 'goto_preset') {
         if (presetToken == null) {
-          return res
-            .status(400)
-            .json({
-              ok: false,
-              error: 'bad_request',
-              message: 'presetToken obbligatorio per goto_preset',
-            })
+          return res.status(400).json({
+            ok: false,
+            error: 'bad_request',
+            message: 'presetToken obbligatorio per goto_preset',
+          })
         }
         // Da esperienze comuni Dahua: preset in arg3
         arg1 = 0
@@ -562,13 +544,11 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
 
     if (cmd === 'goto_preset') {
       if (presetToken == null) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error: 'bad_request',
-            message: 'presetToken obbligatorio per goto_preset',
-          })
+        return res.status(400).json({
+          ok: false,
+          error: 'bad_request',
+          message: 'presetToken obbligatorio per goto_preset',
+        })
       }
       await new Promise((resolve, reject) =>
         cam.gotoPreset({profileToken, presetToken: String(presetToken)}, err =>
@@ -659,6 +639,291 @@ app.post('/v1/webcams/:id/cgi', async (req, res) => {
     return res.json({ok: true, raw: text})
   } catch (e) {
     return res.status(500).json({ok: false, error: 'cgi_error', message: e?.message || String(e)})
+  }
+})
+
+app.post('/v1/webcams/:id/snapshot/force', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass, slug} = req.body || {}
+    if (!ip || !user || !pass || !slug) {
+      return res
+        .status(400)
+        .json({ok: false, error: 'bad_request', message: 'ip,user,pass,slug obbligatori'})
+    }
+
+    const u = new URL(
+      `${req.protocol}://${req.get('host')}/v1/webcams/${encodeURIComponent(req.params.id)}/snapshot`
+    )
+    u.searchParams.set('ip', String(ip))
+    u.searchParams.set('port', String(port))
+    u.searchParams.set('user', String(user))
+    u.searchParams.set('pass', String(pass))
+    u.searchParams.set('_ts', Date.now().toString())
+
+    return res.json({ok: true, url: u.toString(), slug: String(slug)})
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ok: false, error: 'snapshot_force_error', message: e?.message || String(e)})
+  }
+})
+
+app.post('/v1/webcams/:id/ptz/status', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass} = req.body || {}
+    if (!ip || !user || !pass) {
+      return res
+        .status(400)
+        .json({ok: false, error: 'bad_request', message: 'ip,user,pass obbligatori'})
+    }
+
+    const cam = await connectOnvif({
+      ip: String(ip),
+      port: +port,
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 9000,
+    })
+    const profileToken = await getFirstProfileToken(cam)
+
+    const status = await new Promise((resolve, reject) =>
+      cam.getStatus({profileToken}, (err, result) => (err ? reject(err) : resolve(result)))
+    )
+
+    const zoom =
+      status?.position?.zoom?.x ?? status?.position?.Zoom?.x ?? status?.zoom ?? status?.Zoom ?? null
+
+    return res.json({
+      ok: true,
+      zoom: typeof zoom === 'number' ? zoom : null,
+      raw: status || null,
+    })
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ok: false, error: 'ptz_status_error', message: e?.message || String(e)})
+  }
+})
+
+app.post('/v1/webcams/:id/ptz/relative', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass, pan = 0, tilt = 0, zoom = 0} = req.body || {}
+    if (!ip || !user || !pass) {
+      return res
+        .status(400)
+        .json({ok: false, error: 'bad_request', message: 'ip,user,pass obbligatori'})
+    }
+
+    const cam = await connectOnvif({
+      ip: String(ip),
+      port: +port,
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 9000,
+    })
+    const profileToken = await getFirstProfileToken(cam)
+
+    const translation = {
+      x: Number(pan) || 0,
+      y: Number(tilt) || 0,
+      zoom: Number(zoom) || 0,
+    }
+
+    await new Promise((resolve, reject) =>
+      cam.relativeMove({profileToken, translation}, err => (err ? reject(err) : resolve()))
+    )
+
+    return res.json({ok: true})
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ok: false, error: 'ptz_relative_error', message: e?.message || String(e)})
+  }
+})
+
+app.post('/v1/webcams/:id/ptz/stop', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass} = req.body || {}
+    if (!ip || !user || !pass) {
+      return res
+        .status(400)
+        .json({ok: false, error: 'bad_request', message: 'ip,user,pass obbligatori'})
+    }
+
+    const cam = await connectOnvif({
+      ip: String(ip),
+      port: +port,
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 9000,
+    })
+    const profileToken = await getFirstProfileToken(cam)
+
+    await new Promise((resolve, reject) =>
+      cam.stop({profileToken, panTilt: true, zoom: true}, err => (err ? reject(err) : resolve()))
+    )
+
+    return res.json({ok: true})
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ok: false, error: 'ptz_stop_error', message: e?.message || String(e)})
+  }
+})
+
+app.post('/v1/webcams/:id/ptz/absolute', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass, zoom} = req.body || {}
+    if (!ip || !user || !pass || zoom == null) {
+      return res
+        .status(400)
+        .json({ok: false, error: 'bad_request', message: 'ip,user,pass,zoom obbligatori'})
+    }
+
+    const cam = await connectOnvif({
+      ip: String(ip),
+      port: +port,
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 9000,
+    })
+    const profileToken = await getFirstProfileToken(cam)
+
+    const z = Math.max(0, Math.min(1, Number(zoom)))
+
+    await new Promise((resolve, reject) =>
+      cam.absoluteMove(
+        {
+          profileToken,
+          position: {x: 0, y: 0, zoom: z},
+          speed: {x: 0, y: 0, zoom: 1},
+        },
+        err => (err ? reject(err) : resolve())
+      )
+    )
+
+    return res.json({ok: true})
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ok: false, error: 'ptz_absolute_error', message: e?.message || String(e)})
+  }
+})
+
+app.post('/v1/webcams/:id/ptz/dahua', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass, action, code, channel = 0, speed = 1} = req.body || {}
+    if (!ip || !user || !pass || !action || !code) {
+      return res.status(400).json({
+        ok: false,
+        error: 'bad_request',
+        message: 'ip,user,pass,action,code obbligatori',
+      })
+    }
+
+    const base = normalizeBaseUrl(String(ip), port)
+
+    const isZoom = String(code) === 'ZoomTele' || String(code) === 'ZoomWide'
+    const arg1 = 0
+    const arg2 = isZoom ? Number(speed) || 1 : 0
+    const arg3 = isZoom ? 0 : Number(speed) || 1
+
+    const url =
+      `${base}/cgi-bin/ptz.cgi?action=${encodeURIComponent(String(action))}` +
+      `&channel=${encodeURIComponent(String(channel))}` +
+      `&code=${encodeURIComponent(String(code))}` +
+      `&arg1=${encodeURIComponent(String(arg1))}` +
+      `&arg2=${encodeURIComponent(String(arg2))}` +
+      `&arg3=${encodeURIComponent(String(arg3))}`
+
+    const r = await fetchWithBasicOrDigest(url, {
+      method: 'GET',
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 8000,
+    })
+
+    const text = await r.text().catch(() => '')
+    if (!r.ok) {
+      return res
+        .status(502)
+        .json({ok: false, error: 'dahua_ptz_failed', status: r.status, detail: text?.slice(0, 300)})
+    }
+
+    return res.json({ok: true, raw: text})
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ok: false, error: 'dahua_ptz_error', message: e?.message || String(e)})
+  }
+})
+
+app.post('/v1/webcams/:id/onvif/presets', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass} = req.body || {}
+    if (!ip || !user || !pass) {
+      return res
+        .status(400)
+        .json({ok: false, error: 'bad_request', message: 'ip,user,pass obbligatori'})
+    }
+
+    const cam = await connectOnvif({
+      ip: String(ip),
+      port: +port,
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 9000,
+    })
+    const profileToken = await getFirstProfileToken(cam)
+
+    const presets = await new Promise((resolve, reject) =>
+      cam.getPresets({profileToken}, (err, result) => (err ? reject(err) : resolve(result)))
+    )
+
+    const data = (presets || [])
+      .map(p => ({
+        token: p?.$?.token || p?.token || p?.PresetToken || null,
+        name: p?.Name || p?.name || null,
+      }))
+      .filter(p => p.token != null)
+
+    return res.json({ok: true, data})
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ok: false, error: 'presets_error', message: e?.message || String(e)})
+  }
+})
+
+app.post('/v1/webcams/:id/onvif/presets/goto', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass, token} = req.body || {}
+    if (!ip || !user || !pass || token == null) {
+      return res
+        .status(400)
+        .json({ok: false, error: 'bad_request', message: 'ip,user,pass,token obbligatori'})
+    }
+
+    const cam = await connectOnvif({
+      ip: String(ip),
+      port: +port,
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 9000,
+    })
+    const profileToken = await getFirstProfileToken(cam)
+
+    await new Promise((resolve, reject) =>
+      cam.gotoPreset({profileToken, presetToken: String(token)}, err =>
+        err ? reject(err) : resolve()
+      )
+    )
+
+    return res.json({ok: true, message: 'Preset richiamato'})
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ok: false, error: 'presets_goto_error', message: e?.message || String(e)})
   }
 })
 
