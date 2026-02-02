@@ -36,6 +36,11 @@ app.use(
   })
 )
 
+app.use((req, res, next) => {
+  res.setHeader('X-WebcamGo-Control-Api', '1')
+  next()
+})
+
 /* ──────────────────────────────────────────────
  * API KEY middleware
  * - consuma header: x-api-key
@@ -400,10 +405,8 @@ app.post('/v1/webcams/:id/reboot', async (req, res) => {
     }
 
     // Dahua CGI reboot (se serve)
-    if (m === 'dahua_cgi' || b.includes('dahua')) {
+    if (m === 'dahua_cgi') {
       const base = normalizeBaseUrl(String(ip), port)
-      // Nota: endpoint reboot Dahua può variare; questo è un “comune”
-      // Se nel tuo parco usate un path diverso, lo adattiamo.
       const url = `${base}/cgi-bin/magicBox.cgi?action=reboot`
 
       const r = await fetchWithBasicOrDigest(url, {
@@ -574,6 +577,11 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
       const r1 = await fetchWithBasicOrDigest(startUrl, {user, pass, timeoutMs: 7000})
       if (!r1.ok) {
         const text = await r1.text().catch(() => '')
+        console.log('[PTZ][DAHUA] FAIL', {
+          status: r1.status,
+          startUrl,
+          text: text.slice(0, 300),
+        })
         return res
           .status(502)
           .json({ok: false, error: 'ptz_failed', status: r1.status, detail: text?.slice(0, 300)})
