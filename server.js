@@ -7,6 +7,7 @@ const {Cam} = require('onvif')
 const {fetch} = require('undici')
 
 const app = express()
+app.set('trust proxy', 1)
 app.use(express.json({limit: '2mb'}))
 
 /* ──────────────────────────────────────────────
@@ -26,6 +27,10 @@ app.use(
  * - lascia libero /v1/health
  * ────────────────────────────────────────────── */
 function requireApiKey(req, res, next) {
+  // lascia passare i preflight CORS
+  if (req.method === 'OPTIONS') return next()
+
+  // health libero
   if (req.path === '/v1/health') return next()
 
   const required = (process.env.CONTROL_API_KEY || '').trim()
@@ -37,6 +42,7 @@ function requireApiKey(req, res, next) {
   }
   next()
 }
+
 app.use(requireApiKey)
 
 /* ──────────────────────────────────────────────
@@ -425,24 +431,6 @@ app.post('/v1/webcams/:id/reboot', async (req, res) => {
   }
 })
 
-/* ──────────────────────────────────────────────
- * PTZ
- *
- * POST /v1/webcams/:id/ptz
- * Body:
- * {
- *   "ip": "172.29.0.10",
- *   "port": 80,
- *   "user": "...",
- *   "pass": "...",
- *   "brand": "dahua|hikvision|...",
- *   "mode": "onvif|dahua_cgi|hikvision_isapi" (opzionale),
- *   "command": "left|right|up|down|zoom_in|zoom_out|stop|goto_preset",
- *   "speed": 0.5,              // 0..1 (onvif) | 1..8 (dahua cgi)
- *   "durationMs": 200,         // per start/stop automatico
- *   "presetToken": "3"         // per goto_preset
- * }
- * ────────────────────────────────────────────── */
 app.post('/v1/webcams/:id/ptz', async (req, res) => {
   try {
     const {
@@ -510,16 +498,53 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
 
       if (cmd === 'goto_preset') {
         if (presetToken == null) {
-          return res.status(400).json({
-            ok: false,
-            error: 'bad_request',
-            message: 'presetToken obbligatorio per goto_preset',
+          return res
+            .status(400)
+            .json({ok: false, error: 'bad_request', message: 'presetToken obbligatorio'})
+        }
+
+        // Variante A (come non-VPN): preset in arg2
+        const urlA =
+          `${base}/cgi-bin/ptz.cgi?action=start` +
+          `&channel=${channel}&code=GotoPreset&arg1=0&arg2=${encodeURIComponent(String(presetToken))}&arg3=0`
+
+        // Variante B: preset in arg3
+        const urlB =
+          `${base}/cgi-bin/ptz.cgi?action=start` +
+          `&channel=${channel}&code=GotoPreset&arg1=0&arg2=0&arg3=${encodeURIComponent(String(presetToken))}`
+
+        const rA = await fetchWithBasicOrDigest(urlA, {user, pass, timeoutMs: 8000})
+        if (rA.ok) {
+          return res.json({
+            ok: true,
+            via: 'dahua_cgi',
+            command: 'goto_preset',
+            presetToken: String(presetToken),
+            variant: 'arg2',
           })
         }
-        // Da esperienze comuni Dahua: preset in arg3
-        arg1 = 0
-        arg2 = 0
-        arg3 = presetToken
+
+        const rB = await fetchWithBasicOrDigest(urlB, {user, pass, timeoutMs: 8000})
+        if (rB.ok) {
+          return res.json({
+            ok: true,
+            via: 'dahua_cgi',
+            command: 'goto_preset',
+            presetToken: String(presetToken),
+            variant: 'arg3',
+          })
+        }
+
+        const tA = await rA.text().catch(() => '')
+        const tB = await rB.text().catch(() => '')
+        return res.status(502).json({
+          ok: false,
+          error: 'ptz_failed',
+          detail: {
+            arg2: {status: rA.status, text: tA.slice(0, 300)},
+            arg3: {status: rB.status, text: tB.slice(0, 300)},
+          },
+        })
       }
 
       const startUrl =
@@ -620,15 +645,6 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
   }
 })
 
-/* ──────────────────────────────────────────────
- * (Opzionale) CGI “pass-through” controllato
- * Utile per comandi noti, senza esporre path libero.
- *
- * POST /v1/webcams/:id/cgi
- * Body: { "ip":"...", "port":80, "user":"...", "pass":"...", "path":"/cgi-bin/..." }
- *
- * IMPORTANTE: qui blocchiamo path per evitare abusi.
- * ────────────────────────────────────────────── */
 app.post('/v1/webcams/:id/cgi', async (req, res) => {
   try {
     const {ip, port = 80, user, pass, path} = req.body || {}
