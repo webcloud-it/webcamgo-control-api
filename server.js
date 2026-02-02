@@ -28,12 +28,10 @@ app.use(
 function requireApiKey(req, res, next) {
   if (req.path === '/v1/health') return next()
 
-  const required = process.env.CONTROL_API_KEY
-  if (!required) {
-    // se non impostata, NON blocchiamo (ma è meglio impostarla!)
-    return next()
-  }
-  const provided = req.header('x-api-key')
+  const required = (process.env.CONTROL_API_KEY || '').trim()
+  if (!required) return next()
+
+  const provided = (req.header('x-api-key') || '').trim()
   if (!provided || provided !== required) {
     return res.status(401).json({ok: false, error: 'unauthorized'})
   }
@@ -204,6 +202,33 @@ async function getFirstProfileToken(cam) {
   const token = profiles?.[0]?.$?.token || profiles?.[0]?.token
   if (!token) throw new Error('ProfileToken assente')
   return token
+}
+
+function normalizeOnvifPresets(raw) {
+  if (!raw) return []
+
+  // Caso 1: array di preset “classici”
+  if (Array.isArray(raw)) {
+    return raw
+      .map((p, i) => {
+        const token = p?.$?.token || p?.token || p?.PresetToken || p?.presetToken || String(i + 1)
+        const name = p?.Name || p?.name || p?.$?.Name || p?.$?.name || null
+        return {token: String(token), name: name ? String(name) : null}
+      })
+      .filter(p => p.token)
+  }
+
+  // Caso 2: oggetto { token: "Nome" } oppure { token: {name:"Nome"} }
+  if (raw && typeof raw === 'object') {
+    return Object.entries(raw)
+      .map(([token, val]) => ({
+        token: String(token),
+        name: typeof val === 'string' ? val : (val?.name ?? val?.Name ?? `Preset ${token}`),
+      }))
+      .filter(p => p.token)
+  }
+
+  return []
 }
 
 /* ──────────────────────────────────────────────
@@ -876,16 +901,11 @@ app.post('/v1/webcams/:id/onvif/presets', async (req, res) => {
     })
     const profileToken = await getFirstProfileToken(cam)
 
-    const presets = await new Promise((resolve, reject) =>
+    const rawPresets = await new Promise((resolve, reject) =>
       cam.getPresets({profileToken}, (err, result) => (err ? reject(err) : resolve(result)))
     )
 
-    const data = (presets || [])
-      .map(p => ({
-        token: p?.$?.token || p?.token || p?.PresetToken || null,
-        name: p?.Name || p?.name || null,
-      }))
-      .filter(p => p.token != null)
+    const data = normalizeOnvifPresets(rawPresets)
 
     return res.json({ok: true, data})
   } catch (e) {
@@ -897,29 +917,104 @@ app.post('/v1/webcams/:id/onvif/presets', async (req, res) => {
 
 app.post('/v1/webcams/:id/onvif/presets/goto', async (req, res) => {
   try {
-    const {ip, port = 80, user, pass, token} = req.body || {}
+    const {
+      ip,
+      port = 80,
+      user,
+      pass,
+      token,
+      brand = '',
+      mode = '',
+      channel = 1,
+      durationMs = 200,
+    } = req.body || {}
+
     if (!ip || !user || !pass || token == null) {
       return res
         .status(400)
         .json({ok: false, error: 'bad_request', message: 'ip,user,pass,token obbligatori'})
     }
 
-    const cam = await connectOnvif({
-      ip: String(ip),
-      port: +port,
-      user: String(user),
-      pass: String(pass),
-      timeoutMs: 9000,
-    })
-    const profileToken = await getFirstProfileToken(cam)
+    const presetToken = String(token)
+    const b = String(brand).toLowerCase()
+    const m = String(mode).toLowerCase()
+    const isDahua = m === 'dahua_cgi' || b.includes('dahua')
 
-    await new Promise((resolve, reject) =>
-      cam.gotoPreset({profileToken, presetToken: String(token)}, err =>
-        err ? reject(err) : resolve()
+    async function gotoPresetDahuaCgi() {
+      const base = normalizeBaseUrl(String(ip), port)
+
+      const startUrl =
+        `${base}/cgi-bin/ptz.cgi?action=start` +
+        `&channel=${encodeURIComponent(String(channel))}` +
+        `&code=GotoPreset&arg1=0&arg2=0&arg3=${encodeURIComponent(presetToken)}`
+
+      const stopUrl = startUrl.replace('action=start', 'action=stop')
+
+      const r1 = await fetchWithBasicOrDigest(startUrl, {
+        method: 'GET',
+        user: String(user),
+        pass: String(pass),
+        timeoutMs: 8000,
+      })
+
+      if (!r1.ok) {
+        const text = await r1.text().catch(() => '')
+        throw new Error(text?.slice(0, 200) || `HTTP ${r1.status}`)
+      }
+
+      setTimeout(
+        () => {
+          fetchWithBasicOrDigest(stopUrl, {
+            method: 'GET',
+            user: String(user),
+            pass: String(pass),
+            timeoutMs: 8000,
+          }).catch(() => {})
+        },
+        Math.max(50, Math.min(2000, Number(durationMs) || 200))
       )
-    )
+    }
 
-    return res.json({ok: true, message: 'Preset richiamato'})
+    // Se esplicitamente Dahua CGI: non provare ONVIF
+    if (isDahua) {
+      await gotoPresetDahuaCgi()
+      return res.json({
+        ok: true,
+        message: 'Preset richiamato',
+        via: 'dahua_cgi',
+        token: presetToken,
+      })
+    }
+
+    // Prova ONVIF
+    try {
+      const cam = await connectOnvif({
+        ip: String(ip),
+        port: +port,
+        user: String(user),
+        pass: String(pass),
+        timeoutMs: 9000,
+      })
+      const profileToken = await getFirstProfileToken(cam)
+
+      await new Promise((resolve, reject) =>
+        cam.gotoPreset({profileToken, presetToken}, err => (err ? reject(err) : resolve()))
+      )
+
+      return res.json({ok: true, message: 'Preset richiamato', via: 'onvif', token: presetToken})
+    } catch (e) {
+      // Fallback automatico Dahua SOLO se brand/mode lo suggerisce
+      if (b.includes('dahua')) {
+        await gotoPresetDahuaCgi()
+        return res.json({
+          ok: true,
+          message: 'Preset richiamato',
+          via: 'dahua_cgi',
+          token: presetToken,
+        })
+      }
+      throw e
+    }
   } catch (e) {
     return res
       .status(500)
