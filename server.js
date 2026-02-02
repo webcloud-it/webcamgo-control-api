@@ -498,7 +498,7 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
         // Qui usiamo "Left" come placeholder (alcuni firmware lo ignorano e stoppa comunque).
         const stopUrl = `${base}/cgi-bin/ptz.cgi?action=stop&channel=${channel}&code=Left&arg1=0&arg2=0&arg3=0`
         const r = await fetchWithBasicOrDigest(stopUrl, {user, pass, timeoutMs: 7000})
-        if (!r.ok) return res.status(502).json({ok: false, error: 'ptz_failed', status: r.status})
+        if (!r.ok) return res.status(500).json({ok: false, error: 'ptz_failed', status: r.status})
         return res.json({ok: true, via: 'dahua_cgi', command: 'stop'})
       }
 
@@ -557,7 +557,7 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
 
         const tA = await rA.text().catch(() => '')
         const tB = await rB.text().catch(() => '')
-        return res.status(502).json({
+        return res.status(500).json({
           ok: false,
           error: 'ptz_failed',
           detail: {
