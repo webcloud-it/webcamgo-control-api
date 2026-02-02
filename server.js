@@ -10,6 +10,21 @@ const app = express()
 app.set('trust proxy', 1)
 app.use(express.json({limit: '2mb'}))
 
+app.use((req, res, next) => {
+  const start = Date.now()
+  console.log(
+    `[REQ] ${req.method} ${req.originalUrl} origin=${req.headers.origin || '-'} ct=${req.headers['content-type'] || '-'}`
+  )
+
+  res.on('finish', () => {
+    console.log(
+      `[RES] ${req.method} ${req.originalUrl} -> ${res.statusCode} ${Date.now() - start}ms`
+    )
+  })
+
+  next()
+})
+
 /* ──────────────────────────────────────────────
  * CORS (semplice)
  * ────────────────────────────────────────────── */
@@ -432,6 +447,8 @@ app.post('/v1/webcams/:id/reboot', async (req, res) => {
 })
 
 app.post('/v1/webcams/:id/ptz', async (req, res) => {
+  console.log('[PTZ] hit', {id: req.params.id, bodyKeys: Object.keys(req.body || {})})
+
   try {
     const {
       ip,
@@ -1100,6 +1117,22 @@ app.post('/v1/webcams/:id/onvif/device-info', async (req, res) => {
 })
 
 /* ────────────────────────────────────────────── */
+process.on('SIGTERM', () => {
+  console.log('[PROC] SIGTERM received - shutting down')
+})
+
+process.on('SIGINT', () => {
+  console.log('[PROC] SIGINT received - shutting down')
+})
+
+process.on('uncaughtException', err => {
+  console.log('[PROC] uncaughtException', err)
+})
+
+process.on('unhandledRejection', err => {
+  console.log('[PROC] unhandledRejection', err)
+})
+
 const port = process.env.PORT || 3000
 app.listen(port, () => {
   console.log('webcamgo-control-api listening on', port)
