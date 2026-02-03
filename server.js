@@ -257,6 +257,25 @@ function normalizeOnvifPresets(raw) {
   return []
 }
 
+function extractDahuaPowerUpPresetId(text) {
+  const s = String(text || '')
+  const m = s.match(/table\.PowerUp\[0\]\.PresetId\s*=\s*([0-9]+)/i)
+  return m && m[1] ? m[1] : null
+}
+
+async function getDahuaPowerUpPresetId(base, {user, pass}) {
+  const url = `${base}/cgi-bin/configManager.cgi?action=getConfig&name=PowerUp`
+  const r = await fetchWithBasicOrDigest(url, {user, pass, timeoutMs: 8000})
+  const text = await r.text().catch(() => '')
+
+  if (!r.ok) return {ok: false, status: r.status, text: text.slice(0, 500)}
+
+  const presetId = extractDahuaPowerUpPresetId(text)
+  if (!presetId) return {ok: false, status: 200, text: text.slice(0, 500)}
+
+  return {ok: true, presetId}
+}
+
 /* ──────────────────────────────────────────────
  * HEALTH
  * ────────────────────────────────────────────── */
@@ -450,8 +469,6 @@ app.post('/v1/webcams/:id/reboot', async (req, res) => {
 })
 
 app.post('/v1/webcams/:id/ptz', async (req, res) => {
-  console.log('[PTZ] hit', {id: req.params.id, bodyKeys: Object.keys(req.body || {})})
-
   try {
     const {
       ip,
@@ -475,9 +492,9 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
       })
     }
 
-    const b = String(brand).toLowerCase()
-    const m = String(mode).toLowerCase()
-    const cmd = String(command).toLowerCase()
+    const b = String(brand).toLowerCase().trim()
+    const m = String(mode).toLowerCase().trim()
+    const cmd = String(command).toLowerCase().trim()
 
     // ── Dahua CGI PTZ (start + stop automatico)
     if (m === 'dahua_cgi' || b.includes('dahua')) {
@@ -491,6 +508,7 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
         zoom_in: 'ZoomTele',
         zoom_out: 'ZoomWide',
         goto_preset: 'GotoPreset',
+        goto_home: 'GotoPreset', // usa PresetId letto da PowerUp
       }
 
       if (cmd === 'stop') {
@@ -504,9 +522,12 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
 
       const code = dahuaCodeByCommand[cmd]
       if (!code) {
-        return res
-          .status(400)
-          .json({ok: false, error: 'bad_request', message: 'command non supportato per dahua_cgi'})
+        return res.status(400).json({
+          ok: false,
+          error: 'bad_request',
+          message: 'command non supportato per dahua_cgi',
+          debug: {receivedCommand: command, normalized: cmd},
+        })
       }
 
       const sp = Math.max(1, Math.min(8, Math.round(Number(speed) * 8 || 4))) // 1..8
@@ -515,6 +536,64 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
       let arg1 = 0,
         arg2 = isZoom ? sp : 0,
         arg3 = isZoom ? 0 : sp
+
+      if (cmd === 'goto_home') {
+        const cfg = await getDahuaPowerUpPresetId(base, {user, pass})
+        if (!cfg.ok) {
+          return res.status(502).json({
+            ok: false,
+            error: 'ptz_failed',
+            message: 'impossibile leggere PresetId da Ptz.PtzPowerUp',
+            detail: {status: cfg.status, text: cfg.text},
+          })
+        }
+
+        const presetId = String(cfg.presetId)
+
+        const urlArg2 =
+          `${base}/cgi-bin/ptz.cgi?action=start` +
+          `&channel=${channel}&code=GotoPreset&arg1=0&arg2=${encodeURIComponent(presetId)}&arg3=0`
+
+        const urlArg3 =
+          `${base}/cgi-bin/ptz.cgi?action=start` +
+          `&channel=${channel}&code=GotoPreset&arg1=0&arg2=0&arg3=${encodeURIComponent(presetId)}`
+
+        const r2 = await fetchWithBasicOrDigest(urlArg2, {user, pass, timeoutMs: 8000})
+        if (r2.ok) {
+          return res.json({
+            ok: true,
+            via: 'dahua_cgi',
+            command: 'goto_home',
+            presetId,
+            variant: 'arg2',
+          })
+        }
+
+        const r3 = await fetchWithBasicOrDigest(urlArg3, {user, pass, timeoutMs: 8000})
+        if (r3.ok) {
+          return res.json({
+            ok: true,
+            via: 'dahua_cgi',
+            command: 'goto_home',
+            presetId,
+            variant: 'arg3',
+            note: 'fallback (arg2 non accettato dal firmware)',
+          })
+        }
+
+        const t2 = await r2.text().catch(() => '')
+        const t3 = await r3.text().catch(() => '')
+        return res.status(502).json({
+          ok: false,
+          error: 'ptz_failed',
+          message: 'GotoPreset fallito anche dopo lettura PresetId',
+          detail: {
+            presetId,
+            arg2: {status: r2.status, text: t2.slice(0, 300)},
+            arg3: {status: r3.status, text: t3.slice(0, 300)},
+          },
+        })
+      }
 
       if (cmd === 'goto_preset') {
         if (presetToken == null) {
