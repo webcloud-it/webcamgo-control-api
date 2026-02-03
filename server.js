@@ -372,6 +372,59 @@ app.get('/v1/webcams/:id/snapshot', async (req, res) => {
   }
 })
 
+app.get('/v1/leash/:slug', async (req, res) => {
+  try {
+    const slug = String(req.params.slug || '').trim()
+    const datetime = String(req.query.datetime || '').trim()
+    const width = String(req.query.width || '').trim()
+    const height = String(req.query.height || '').trim()
+
+    if (!slug || !datetime || !width || !height) {
+      return res.status(400).json({
+        ok: false,
+        error: 'bad_request',
+        message: 'slug, datetime, width, height obbligatori',
+      })
+    }
+
+    const token = process.env.LEASH_TOKEN
+    if (!token) {
+      return res.status(500).json({
+        ok: false,
+        error: 'misconfig',
+        message: 'LEASH_TOKEN mancante',
+      })
+    }
+
+    const url =
+      `https://leash.cloud.webcamgo.com/${encodeURIComponent(slug)}` +
+      `?datetime=${encodeURIComponent(datetime)}` +
+      `&width=${encodeURIComponent(width)}` +
+      `&height=${encodeURIComponent(height)}`
+
+    const r = await fetch(url, {
+      headers: {Authorization: `Bearer ${token}`},
+    })
+
+    if (!r.ok) {
+      const text = await r.text().catch(() => '')
+      return res.status(502).json({
+        ok: false,
+        error: 'upstream_error',
+        message: `Leash error HTTP ${r.status}`,
+        detail: text.slice(0, 300),
+      })
+    }
+
+    // leash risponde con image/png
+    res.setHeader('Content-Type', r.headers.get('content-type') || 'image/png')
+    const buf = Buffer.from(await r.arrayBuffer())
+    return res.status(200).send(buf)
+  } catch (e) {
+    return res.status(500).json({ok: false, error: 'proxy_error', message: e?.message || String(e)})
+  }
+})
+
 /* ──────────────────────────────────────────────
  * REBOOT
  *
