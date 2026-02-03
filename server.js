@@ -1236,6 +1236,94 @@ app.get('/v1/leash/:slug', async (req, res) => {
   }
 })
 
+app.post('/v1/webcams/:id/snapshot/force-masked', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass, slug} = req.body || {}
+    if (!ip || !user || !pass || !slug) {
+      return res.status(400).json({
+        ok: false,
+        error: 'bad_request',
+        message: 'ip,user,pass,slug obbligatori',
+      })
+    }
+
+    // 1) scarica jpeg RAW (stessa logica del tuo /v1/webcams/:id/snapshot)
+    const u = new URL(
+      `${req.protocol}://${req.get('host')}/v1/webcams/${encodeURIComponent(req.params.id)}/snapshot`
+    )
+    u.searchParams.set('ip', String(ip))
+    u.searchParams.set('port', String(port))
+    u.searchParams.set('user', String(user))
+    u.searchParams.set('pass', String(pass))
+    u.searchParams.set('_ts', Date.now().toString())
+
+    const rawRes = await fetch(u.toString(), {
+      headers: {
+        // IMPORTANTISSIMO: questo endpoint è interno al control-api, non serve api-key
+        'Accept': 'image/jpeg,image/*',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      },
+    })
+
+    if (!rawRes.ok) {
+      const text = await rawRes.text().catch(() => '')
+      return res.status(502).json({
+        ok: false,
+        error: 'snapshot_failed',
+        message: `snapshot http ${rawRes.status}`,
+        detail: text.slice(0, 300),
+      })
+    }
+
+    const rawBuf = Buffer.from(await rawRes.arrayBuffer())
+    const imageBase64 = rawBuf.toString('base64')
+
+    // 2) chiama leash /render
+    const leashToken = process.env.LEASH_TOKEN
+    if (!leashToken) {
+      return res.status(500).json({ok: false, error: 'misconfig', message: 'LEASH_TOKEN mancante'})
+    }
+
+    const width = 1920
+    const height = 1080
+    const datetime = new Date().toISOString()
+
+    const leashRes = await fetch(`https://leash.cloud.webcamgo.com/render`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${leashToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        slug,
+        datetime,
+        width,
+        height,
+        imageBase64,
+      }),
+    })
+
+    if (!leashRes.ok) {
+      const text = await leashRes.text().catch(() => '')
+      return res.status(502).json({
+        ok: false,
+        error: 'leash_failed',
+        message: `Leash error HTTP ${leashRes.status}`,
+        detail: text.slice(0, 300),
+      })
+    }
+
+    res.setHeader('Content-Type', leashRes.headers.get('content-type') || 'image/png')
+    const out = Buffer.from(await leashRes.arrayBuffer())
+    return res.status(200).send(out)
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ok: false, error: 'force_masked_error', message: e?.message || String(e)})
+  }
+})
+
 /* ────────────────────────────────────────────── */
 process.on('SIGTERM', () => {
   console.log('[PROC] SIGTERM received - shutting down')
