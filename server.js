@@ -284,160 +284,7 @@ app.get('/v1/health', (req, res) => {
 })
 
 /* ──────────────────────────────────────────────
- * SNAPSHOT (realtime)
- *
- * Modalità supportate:
- * A) GET /v1/webcams/:id/snapshot?url=http://...  (+ user/pass)
- * B) GET /v1/webcams/:id/snapshot?ip=172.29.0.10&port=80&user=...&pass=...
- *    → prova ONVIF getSnapshotUri e poi scarica la JPEG
- *
- * Risposta:
- * - 200 image/jpeg (stream)
- * - oppure JSON errore
- * ────────────────────────────────────────────── */
-app.get('/v1/webcams/:id/snapshot', async (req, res) => {
-  try {
-    const {url, ip, port, user, pass} = req.query
-
-    // Se arriva un URL esplicito, usiamo quello
-    let snapshotUrl = url ? String(url) : null
-
-    // Altrimenti proviamo ONVIF per ottenere snapshotUri
-    if (!snapshotUrl) {
-      if (!ip || !user || !pass) {
-        return res.status(400).json({
-          ok: false,
-          error: 'bad_request',
-          message: 'Richiesti: url oppure (ip,user,pass).',
-        })
-      }
-
-      const cam = await connectOnvif({
-        ip: String(ip),
-        port: port ? +port : 80,
-        user: String(user),
-        pass: String(pass),
-      })
-      const uri = await new Promise((resolve, reject) =>
-        cam.getSnapshotUri((err, data) =>
-          err ? reject(err) : resolve(data?.uri || data?.Uri || null)
-        )
-      )
-      if (!uri) throw new Error('URI snapshot non ricevuta via ONVIF')
-      snapshotUrl = String(uri)
-    }
-
-    // Cache-buster per “realtime”
-    const u = new URL(/^https?:\/\//i.test(snapshotUrl) ? snapshotUrl : `http://${snapshotUrl}`)
-    u.searchParams.set('_ts', Date.now().toString())
-    const cacheBusted = u.toString()
-
-    const r = await fetchWithBasicOrDigest(cacheBusted, {
-      method: 'GET',
-      user: user ? String(user) : undefined,
-      pass: pass ? String(pass) : undefined,
-      timeoutMs: 10000,
-      headers: {
-        'Accept': 'image/jpeg',
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Pragma': 'no-cache',
-      },
-    })
-
-    if (!r.ok) {
-      const text = await r.text().catch(() => '')
-      return res.status(502).json({
-        ok: false,
-        error: 'snapshot_failed',
-        status: r.status,
-        detail: text?.slice(0, 300) || r.statusText,
-      })
-    }
-
-    const ct = r.headers.get('content-type') || ''
-    if (!/image\/jpeg/i.test(ct) && !/image\//i.test(ct)) {
-      // alcune cam non mettono content-type: proviamo comunque
-    }
-
-    res.setHeader('Content-Type', 'image/jpeg')
-    res.setHeader('Cache-Control', 'no-store')
-    const buf = Buffer.from(await r.arrayBuffer())
-    return res.status(200).send(buf)
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: 'snapshot_error',
-      message: e?.message || String(e),
-    })
-  }
-})
-
-app.get('/v1/leash/:slug', async (req, res) => {
-  try {
-    const slug = String(req.params.slug || '').trim()
-    const datetime = String(req.query.datetime || '').trim()
-    const width = String(req.query.width || '').trim()
-    const height = String(req.query.height || '').trim()
-
-    if (!slug || !datetime || !width || !height) {
-      return res.status(400).json({
-        ok: false,
-        error: 'bad_request',
-        message: 'slug, datetime, width, height obbligatori',
-      })
-    }
-
-    const token = process.env.LEASH_TOKEN
-    if (!token) {
-      return res.status(500).json({
-        ok: false,
-        error: 'misconfig',
-        message: 'LEASH_TOKEN mancante',
-      })
-    }
-
-    const url =
-      `https://leash.cloud.webcamgo.com/${encodeURIComponent(slug)}` +
-      `?datetime=${encodeURIComponent(datetime)}` +
-      `&width=${encodeURIComponent(width)}` +
-      `&height=${encodeURIComponent(height)}`
-
-    const r = await fetch(url, {
-      headers: {Authorization: `Bearer ${token}`},
-    })
-
-    if (!r.ok) {
-      const text = await r.text().catch(() => '')
-      return res.status(502).json({
-        ok: false,
-        error: 'upstream_error',
-        message: `Leash error HTTP ${r.status}`,
-        detail: text.slice(0, 300),
-      })
-    }
-
-    // leash risponde con image/png
-    res.setHeader('Content-Type', r.headers.get('content-type') || 'image/png')
-    const buf = Buffer.from(await r.arrayBuffer())
-    return res.status(200).send(buf)
-  } catch (e) {
-    return res.status(500).json({ok: false, error: 'proxy_error', message: e?.message || String(e)})
-  }
-})
-
-/* ──────────────────────────────────────────────
  * REBOOT
- *
- * POST /v1/webcams/:id/reboot
- * Body:
- * {
- *   "ip": "172.29.0.10",
- *   "port": 80,
- *   "user": "...",
- *   "pass": "...",
- *   "brand": "hikvision|dahua|..." (opzionale),
- *   "mode": "onvif|hikvision_isapi|dahua_cgi" (opzionale)
- * }
  * ────────────────────────────────────────────── */
 app.post('/v1/webcams/:id/reboot', async (req, res) => {
   try {
@@ -840,32 +687,6 @@ app.post('/v1/webcams/:id/cgi', async (req, res) => {
   }
 })
 
-app.post('/v1/webcams/:id/snapshot/force', async (req, res) => {
-  try {
-    const {ip, port = 80, user, pass, slug} = req.body || {}
-    if (!ip || !user || !pass || !slug) {
-      return res
-        .status(400)
-        .json({ok: false, error: 'bad_request', message: 'ip,user,pass,slug obbligatori'})
-    }
-
-    const u = new URL(
-      `${req.protocol}://${req.get('host')}/v1/webcams/${encodeURIComponent(req.params.id)}/snapshot`
-    )
-    u.searchParams.set('ip', String(ip))
-    u.searchParams.set('port', String(port))
-    u.searchParams.set('user', String(user))
-    u.searchParams.set('pass', String(pass))
-    u.searchParams.set('_ts', Date.now().toString())
-
-    return res.json({ok: true, url: u.toString(), slug: String(slug)})
-  } catch (e) {
-    return res
-      .status(500)
-      .json({ok: false, error: 'snapshot_force_error', message: e?.message || String(e)})
-  }
-})
-
 app.post('/v1/webcams/:id/ptz/status', async (req, res) => {
   try {
     const {ip, port = 80, user, pass} = req.body || {}
@@ -1253,6 +1074,165 @@ app.post('/v1/webcams/:id/onvif/device-info', async (req, res) => {
       error: 'onvif_device_info_error',
       message: e?.message || String(e),
     })
+  }
+})
+
+/* ──────────────────────────────────────────────
+ * SNAPSHOT (realtime)
+ * ────────────────────────────────────────────── */
+app.get('/v1/webcams/:id/snapshot', async (req, res) => {
+  try {
+    const {url, ip, port, user, pass} = req.query
+
+    // Se arriva un URL esplicito, usiamo quello
+    let snapshotUrl = url ? String(url) : null
+
+    // Altrimenti proviamo ONVIF per ottenere snapshotUri
+    if (!snapshotUrl) {
+      if (!ip || !user || !pass) {
+        return res.status(400).json({
+          ok: false,
+          error: 'bad_request',
+          message: 'Richiesti: url oppure (ip,user,pass).',
+        })
+      }
+
+      const cam = await connectOnvif({
+        ip: String(ip),
+        port: port ? +port : 80,
+        user: String(user),
+        pass: String(pass),
+      })
+      const uri = await new Promise((resolve, reject) =>
+        cam.getSnapshotUri((err, data) =>
+          err ? reject(err) : resolve(data?.uri || data?.Uri || null)
+        )
+      )
+      if (!uri) throw new Error('URI snapshot non ricevuta via ONVIF')
+      snapshotUrl = String(uri)
+    }
+
+    // Cache-buster per “realtime”
+    const u = new URL(/^https?:\/\//i.test(snapshotUrl) ? snapshotUrl : `http://${snapshotUrl}`)
+    u.searchParams.set('_ts', Date.now().toString())
+    const cacheBusted = u.toString()
+
+    const r = await fetchWithBasicOrDigest(cacheBusted, {
+      method: 'GET',
+      user: user ? String(user) : undefined,
+      pass: pass ? String(pass) : undefined,
+      timeoutMs: 10000,
+      headers: {
+        'Accept': 'image/jpeg',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+      },
+    })
+
+    if (!r.ok) {
+      const text = await r.text().catch(() => '')
+      return res.status(502).json({
+        ok: false,
+        error: 'snapshot_failed',
+        status: r.status,
+        detail: text?.slice(0, 300) || r.statusText,
+      })
+    }
+
+    const ct = r.headers.get('content-type') || ''
+    if (!/image\/jpeg/i.test(ct) && !/image\//i.test(ct)) {
+      // alcune cam non mettono content-type: proviamo comunque
+    }
+
+    res.setHeader('Content-Type', 'image/jpeg')
+    res.setHeader('Cache-Control', 'no-store')
+    const buf = Buffer.from(await r.arrayBuffer())
+    return res.status(200).send(buf)
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: 'snapshot_error',
+      message: e?.message || String(e),
+    })
+  }
+})
+
+app.post('/v1/webcams/:id/snapshot/force', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass, slug} = req.body || {}
+    if (!ip || !user || !pass || !slug) {
+      return res
+        .status(400)
+        .json({ok: false, error: 'bad_request', message: 'ip,user,pass,slug obbligatori'})
+    }
+
+    const u = new URL(
+      `${req.protocol}://${req.get('host')}/v1/webcams/${encodeURIComponent(req.params.id)}/snapshot`
+    )
+    u.searchParams.set('ip', String(ip))
+    u.searchParams.set('port', String(port))
+    u.searchParams.set('user', String(user))
+    u.searchParams.set('pass', String(pass))
+    u.searchParams.set('_ts', Date.now().toString())
+
+    return res.json({ok: true, url: u.toString(), slug: String(slug)})
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ok: false, error: 'snapshot_force_error', message: e?.message || String(e)})
+  }
+})
+
+app.get('/v1/leash/:slug', async (req, res) => {
+  try {
+    const slug = String(req.params.slug || '').trim()
+    const datetime = String(req.query.datetime || '').trim()
+    const width = String(req.query.width || '').trim()
+    const height = String(req.query.height || '').trim()
+
+    if (!slug || !datetime || !width || !height) {
+      return res.status(400).json({
+        ok: false,
+        error: 'bad_request',
+        message: 'slug, datetime, width, height obbligatori',
+      })
+    }
+
+    const token = process.env.LEASH_TOKEN
+    if (!token) {
+      return res.status(500).json({
+        ok: false,
+        error: 'misconfig',
+        message: 'LEASH_TOKEN mancante',
+      })
+    }
+
+    const url =
+      `https://leash.cloud.webcamgo.com/${encodeURIComponent(slug)}` +
+      `?datetime=${encodeURIComponent(datetime)}` +
+      `&width=${encodeURIComponent(width)}` +
+      `&height=${encodeURIComponent(height)}`
+
+    const r = await fetch(url, {
+      headers: {Authorization: `Bearer ${token}`},
+    })
+
+    if (!r.ok) {
+      const text = await r.text().catch(() => '')
+      return res.status(502).json({
+        ok: false,
+        error: 'upstream_error',
+        message: `Leash error HTTP ${r.status}`,
+        detail: text.slice(0, 300),
+      })
+    }
+
+    // leash risponde con image/png
+    res.setHeader('Content-Type', r.headers.get('content-type') || 'image/png')
+    const buf = Buffer.from(await r.arrayBuffer())
+    return res.status(200).send(buf)
+  } catch (e) {
+    return res.status(500).json({ok: false, error: 'proxy_error', message: e?.message || String(e)})
   }
 })
 
