@@ -1263,6 +1263,7 @@ app.post('/v1/webcams/:id/snapshot/force-masked', async (req, res) => {
         'Accept': 'image/jpeg,image/*',
         'Cache-Control': 'no-cache',
         'Pragma': 'no-cache',
+        'x-api-key': process.env.CONTROL_API_KEY,
       },
     })
 
