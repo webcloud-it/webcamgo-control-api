@@ -276,16 +276,134 @@ async function getDahuaPowerUpPresetId(base, {user, pass}) {
   return {ok: true, presetId}
 }
 
-/* ──────────────────────────────────────────────
- * HEALTH
- * ────────────────────────────────────────────── */
 app.get('/v1/health', (req, res) => {
   res.json({ok: true, service: 'webcamgo-control-api'})
 })
 
-/* ──────────────────────────────────────────────
- * REBOOT
- * ────────────────────────────────────────────── */
+app.get('/onvif', async (req, res) => {
+  const {ip, user, pass, port: port = 80} = req.query
+  if (!ip || !user || !pass) {
+    return res.status(400).json({
+      success: false,
+      error: 'Parametri richiesti: ip, user, pass',
+      error_type: 'bad_request',
+    })
+  }
+
+  try {
+    const cam = await connectOnvif({
+      ip: String(ip),
+      port: +port,
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 10000,
+    })
+
+    const out = {
+      success: true,
+      ip_address: String(ip),
+      uri: `http://${ip}:${port}/onvif/device_service`,
+      errors: {},
+    }
+
+    // Device information
+    try {
+      const info = await new Promise((ok, ko) =>
+        cam.getDeviceInformation((e, i) => (e ? ko(e) : ok(i)))
+      )
+      Object.assign(out, {
+        model_number: info?.Model ?? info?.model ?? null,
+        firmware_version: info?.FirmwareVersion ?? info?.firmwareVersion ?? null,
+        serial_number: info?.SerialNumber ?? info?.serialNumber ?? null,
+        manufacturer: info?.Manufacturer ?? info?.manufacturer ?? null,
+        hardware: info?.HardwareId ?? info?.hardwareId ?? null,
+      })
+    } catch (e) {
+      out.errors.device_info = e?.message || String(e)
+    }
+
+    // Capabilities / ONVIF version / PTZ supported
+    try {
+      const caps = await new Promise((ok, ko) => cam.getCapabilities((e, d) => (e ? ko(e) : ok(d))))
+
+      out.ptz_supported = Boolean(caps?.PTZ?.XAddr)
+      out.services = Object.keys(cam.services || {})
+
+      const supported = caps?.device?.system?.supportedVersions
+      const versionFromSupported =
+        Array.isArray(supported) && supported.length > 0
+          ? `${supported.at(-1).major}.${supported.at(-1).minor}`
+          : null
+
+      const versionFromNamespace = caps?.media?.Namespace?.match(/ver=(\d+\.\d+)/)?.[1]
+      out.onvif_version = versionFromSupported || versionFromNamespace || null
+    } catch (e) {
+      out.errors.onvif_version = 'getCapabilities: ' + (e?.message || String(e))
+    }
+
+    // PTZ controls + zoom
+    try {
+      const profiles = await new Promise((resolve, reject) =>
+        cam.getProfiles((err, result) => (err ? reject(err) : resolve(result)))
+      )
+
+      const ptzConfigs = (profiles || []).map(p => ({
+        zoomPresent: !!p?.PTZConfiguration?.ZoomLimits,
+        panTiltPresent: !!p?.PTZConfiguration?.PanTiltLimits,
+      }))
+
+      out.ptz_zoom = ptzConfigs.some(p => p.zoomPresent)
+      out.ptz_controls = ptzConfigs.some(p => p.panTiltPresent)
+    } catch (e) {
+      out.errors.ptz_profile = 'getProfiles: ' + (e?.message || String(e))
+      out.ptz_controls = false
+      out.ptz_zoom = false
+    }
+
+    // services list (best effort)
+    try {
+      out.services = cam.services ? Object.keys(cam.services) : []
+    } catch (e) {
+      out.errors.services = e?.message || String(e)
+    }
+
+    // RTSP URI (best effort)
+    try {
+      const r = await new Promise((ok, ko) =>
+        cam.getStreamUri({protocol: 'RTSP', profileToken: '000'}, (e, r) => (e ? ko(e) : ok(r)))
+      )
+      out.rtsp_uri = r?.uri || null
+    } catch (e) {
+      out.errors.rtsp_uri = e?.message || String(e)
+    }
+
+    // System time (best effort)
+    try {
+      const xml = await new Promise((ok, ko) =>
+        cam.getSystemDateAndTime((e, _d, raw) => (e ? ko(e) : ok(raw)))
+      )
+      out.system_time = xml || null
+    } catch (e) {
+      out.errors.system_time = e?.message || String(e)
+    }
+
+    return res.json(out)
+  } catch (err) {
+    let error_type = 'unknown'
+    if (err?.name === 'AbortError') error_type = 'timeout'
+    else if (String(err?.message || '').includes('ENOTFOUND')) error_type = 'dns'
+    else if (String(err?.message || '').includes('401')) error_type = 'unauthorized'
+    else if (String(err?.message || '').includes('ECONNREFUSED')) error_type = 'unreachable'
+    else if (String(err?.message || '').includes('ETIMEDOUT')) error_type = 'timeout'
+
+    return res.json({
+      success: false,
+      error: err?.message || String(err),
+      error_type,
+    })
+  }
+})
+
 app.post('/v1/webcams/:id/reboot', async (req, res) => {
   try {
     const {ip, port = 80, user, pass, brand = '', mode = ''} = req.body || {}
