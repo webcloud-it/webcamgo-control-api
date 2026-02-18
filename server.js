@@ -276,6 +276,77 @@ async function getDahuaPowerUpPresetId(base, {user, pass}) {
   return {ok: true, presetId}
 }
 
+// ✅ parse risposta Dahua: righe "table.Encode[0].MainFormat[0].Video.X=Y"
+function parseKeyValueBody(bodyText = '') {
+  const out = {}
+  String(bodyText)
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean)
+    .forEach(line => {
+      const idx = line.indexOf('=')
+      if (idx <= 0) return
+      const k = line.slice(0, idx).trim()
+      const v = line.slice(idx + 1).trim()
+      out[k] = v
+    })
+  return out
+}
+
+// ✅ estrae i campi che ti interessano dal Main stream
+function pickDahuaMainVideo(cfg) {
+  // MainFormat[0] = Main Stream in tantissime Dahua (è quello che ti serve per la tua schermata)
+  const base = 'table.Encode[0].MainFormat[0].Video.'
+
+  const compression = cfg[base + 'Compression'] || null // H.264 / H.265
+  const resolution = cfg[base + 'resolution'] || null // es "1920x1080"
+  const fps = cfg[base + 'FPS'] ? Number(cfg[base + 'FPS']) : null
+  const bitrateCtrl = cfg[base + 'BitRateControl'] || null // CBR / VBR
+  const bitrate = cfg[base + 'BitRate'] ? Number(cfg[base + 'BitRate']) : null
+  const gop = cfg[base + 'GOP'] ? Number(cfg[base + 'GOP']) : null // spesso equivale a I-Frame interval
+
+  // width/height (se presenti)
+  const width = cfg[base + 'Width'] ? Number(cfg[base + 'Width']) : null
+  const height = cfg[base + 'Height'] ? Number(cfg[base + 'Height']) : null
+
+  return {
+    encoding: compression,
+    bitrate_type: bitrateCtrl,
+    bitrate_kbps: bitrate,
+    fps,
+    gop,
+    resolution:
+      width && height
+        ? {width, height}
+        : resolution
+          ? (() => {
+              const [w, h] = resolution.split('x').map(n => Number(n))
+              return w && h ? {width: w, height: h} : {width: null, height: null}
+            })()
+          : {width: null, height: null},
+    raw: cfg,
+  }
+}
+
+async function digestGetText(url, user, pass, {timeoutMs = 8000, headers = {}} = {}) {
+  const r = await fetchWithBasicOrDigest(url, {
+    method: 'GET',
+    user,
+    pass,
+    timeoutMs,
+    headers: {Accept: 'text/plain,*/*', ...headers},
+  })
+
+  const text = await r.text().catch(() => '')
+  if (!r.ok) {
+    const err = new Error(text?.slice(0, 200) || `HTTP ${r.status}`)
+    err.status = r.status
+    err.body = text
+    throw err
+  }
+  return text
+}
+
 app.get('/v1/health', (req, res) => {
   res.json({ok: true, service: 'webcamgo-control-api'})
 })
@@ -1474,30 +1545,25 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
 
     const getToken = p => p?.$?.token || p?.token || null
 
-    // 1) se arriva profileToken, usa quello
-    // 2) altrimenti primo profilo con VideoEncoderConfiguration
-    // 3) altrimenti primo profilo
     let p =
       (profileToken && profiles.find(x => String(getToken(x)) === String(profileToken))) ||
       profiles.find(x => x?.VideoEncoderConfiguration) ||
       profiles[0]
 
     const token = getToken(p)
-    // ... dopo aver scelto `p` e `token` (profile token)
     const vProfile = p?.VideoEncoderConfiguration || null
 
     let v = vProfile
     let encoderSource = vProfile ? 'profile.VideoEncoderConfiguration' : null
     let allEncoderConfigs = null
 
-    // ✅ FALLBACK: GetVideoEncoderConfigurations (molte cam espongono qui)
+    // 1) fallback: GetVideoEncoderConfigurations
     try {
       if (!v && typeof cam.getVideoEncoderConfigurations === 'function') {
         allEncoderConfigs = await new Promise((resolve, reject) =>
           cam.getVideoEncoderConfigurations((err, result) => (err ? reject(err) : resolve(result)))
         )
 
-        // normalizza array
         const list = Array.isArray(allEncoderConfigs)
           ? allEncoderConfigs
           : allEncoderConfigs?.VideoEncoderConfigurations ||
@@ -1511,7 +1577,7 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
           const br = Number(c?.RateControl?.BitrateLimit ?? null)
 
           let s = 0
-          if (w && h) s += (w * h) / 1000000 // peso su megapixel
+          if (w && h) s += (w * h) / 1000000
           if (fps) s += 5
           if (br) s += 5
 
@@ -1533,39 +1599,78 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
           encoderSource = 'getVideoEncoderConfigurations'
         }
       }
-    } catch (_) {
-      // non deve rompere l’endpoint
+    } catch (_) {}
+
+    // Normalizza ONVIF
+    const encoderNormalized = v
+      ? {
+          encoding: v?.Encoding || v?.encoding || null,
+          resolution: {
+            width: Number(v?.Resolution?.Width ?? v?.resolution?.width ?? null),
+            height: Number(v?.Resolution?.Height ?? v?.resolution?.height ?? null),
+          },
+          fps: Number(v?.RateControl?.FrameRateLimit ?? v?.rateControl?.frameRateLimit ?? null),
+          bitrate_kbps: Number(
+            v?.RateControl?.BitrateLimit ?? v?.rateControl?.bitrateLimit ?? null
+          ),
+          gop: Number(v?.GovLength ?? v?.govLength ?? v?.$?.GovLength ?? v?.$?.govLength ?? null),
+          raw: v,
+        }
+      : null
+
+    const encoderLooksEmpty =
+      !encoderNormalized ||
+      !(
+        encoderNormalized.encoding ||
+        encoderNormalized.resolution?.width ||
+        encoderNormalized.resolution?.height ||
+        encoderNormalized.fps ||
+        encoderNormalized.bitrate_kbps ||
+        encoderNormalized.gop
+      )
+
+    // 2) fallback Dahua solo se ONVIF è vuoto
+    let dahua = null
+    if (encoderLooksEmpty) {
+      try {
+        const url = `http://${ip}:${+port}/cgi-bin/configManager.cgi?action=getConfig&name=Encode`
+        const text = await digestGetText(url, user, pass)
+        const cfg = parseKeyValueBody(text)
+        dahua = pickDahuaMainVideo(cfg)
+      } catch (_) {}
     }
+
+    const encoderFinal = !encoderLooksEmpty
+      ? encoderNormalized
+      : dahua
+        ? {
+            encoding: dahua.encoding,
+            resolution: dahua.resolution,
+            fps: dahua.fps,
+            bitrate_kbps: dahua.bitrate_kbps,
+            gop: dahua.gop,
+            raw: dahua.raw,
+          }
+        : null
 
     const out = {
       ok: true,
       profile: {token, name: p?.Name || p?.name || null},
 
-      encoder_source: encoderSource, // ✅ utile in UI
-      encoder: v
-        ? {
-            encoding: v?.Encoding || v?.encoding || null,
-            resolution: {
-              width: Number(v?.Resolution?.Width ?? v?.resolution?.width ?? null),
-              height: Number(v?.Resolution?.Height ?? v?.resolution?.height ?? null),
-            },
-            fps: Number(v?.RateControl?.FrameRateLimit ?? v?.rateControl?.frameRateLimit ?? null),
-            bitrate_kbps: Number(
-              v?.RateControl?.BitrateLimit ?? v?.rateControl?.bitrateLimit ?? null
-            ),
-            gop: Number(v?.GovLength ?? v?.govLength ?? v?.$?.GovLength ?? v?.$?.govLength ?? null),
-            raw: v,
-          }
-        : null,
+      encoder_source: !encoderLooksEmpty
+        ? encoderSource
+        : dahua
+          ? 'dahua.configManager.Encode'
+          : encoderSource,
 
-      // ✅ elenco profili come prima
+      encoder: encoderFinal,
+
       profiles: profiles.map(x => ({
         token: getToken(x),
         name: x?.Name || x?.name || null,
         hasVideoEncoderConfiguration: !!x?.VideoEncoderConfiguration,
       })),
 
-      // ✅ per debug (capisci se l’encoder c’è ma non matcha)
       encoder_configs: Array.isArray(allEncoderConfigs)
         ? allEncoderConfigs.map(c => ({
             token: c?.$?.token || c?.token || null,
@@ -1579,10 +1684,11 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
           }))
         : null,
 
+      dahua_encode: dahua || null,
       options: null,
     }
 
-    // Opzionale: options (se la libreria lo supporta davvero)
+    // options (solo ONVIF)
     try {
       if (typeof cam.getVideoEncoderConfigurationOptions === 'function' && v?.$?.token) {
         const opts = await new Promise((resolve, reject) =>
@@ -1597,11 +1703,9 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
 
     return res.json(out)
   } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: 'onvif_encoder_error',
-      message: e?.message || String(e),
-    })
+    return res
+      .status(500)
+      .json({ok: false, error: 'onvif_encoder_error', message: e?.message || String(e)})
   }
 })
 
