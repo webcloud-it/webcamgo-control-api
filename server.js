@@ -1523,6 +1523,46 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
         .json({ok: false, error: 'bad_request', message: 'ip,user,pass obbligatori'})
     }
 
+    // helper: Number(null) = 0 (sbagliato) → qui deve diventare null
+    const toNumOrNull = v => {
+      if (v === undefined || v === null || v === '') return null
+      const n = Number(v)
+      return Number.isFinite(n) ? n : null
+    }
+
+    const normalizeEncoderConfigsList = raw => {
+      if (!raw) return []
+      if (Array.isArray(raw)) return raw
+      if (Array.isArray(raw.VideoEncoderConfigurations)) return raw.VideoEncoderConfigurations
+      if (Array.isArray(raw.videoEncoderConfigurations)) return raw.videoEncoderConfigurations
+      if (Array.isArray(raw?.GetVideoEncoderConfigurationsResponse?.Configurations))
+        return raw.GetVideoEncoderConfigurationsResponse.Configurations
+      return []
+    }
+
+    function scoreCfg(c, profileName = '') {
+      const w = toNumOrNull(c?.Resolution?.Width ?? c?.resolution?.width)
+      const h = toNumOrNull(c?.Resolution?.Height ?? c?.resolution?.height)
+      const fps = toNumOrNull(c?.RateControl?.FrameRateLimit ?? c?.rateControl?.frameRateLimit)
+      const br = toNumOrNull(c?.RateControl?.BitrateLimit ?? c?.rateControl?.bitrateLimit)
+
+      let s = 0
+      if (w && h) s += (w * h) / 1000000
+      if (fps) s += 5
+      if (br) s += 5
+
+      const name = String(profileName || '').toLowerCase()
+      if (name.includes('mainstream')) s += w && h ? 10 : 0
+      if (name.includes('substream')) s -= w && h ? 5 : 0
+      return s
+    }
+
+    function pickBestConfig(list, profileName) {
+      const arr = Array.isArray(list) ? list : []
+      if (!arr.length) return null
+      return arr.map(c => ({c, s: scoreCfg(c, profileName)})).sort((a, b) => b.s - a.s)[0].c
+    }
+
     const cam = await new Promise((resolve, reject) => {
       new Cam(
         {hostname: String(ip), username: String(user), password: String(pass), port: +port},
@@ -1555,65 +1595,36 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
 
     let v = vProfile
     let encoderSource = vProfile ? 'profile.VideoEncoderConfiguration' : null
-    let allEncoderConfigs = null
+    let allEncoderConfigsRaw = null
+    let allEncoderConfigsList = []
 
-    // 1) fallback: GetVideoEncoderConfigurations
+    // 1) fallback: GetVideoEncoderConfigurations (se manca la VideoEncoderConfiguration nel profilo)
     try {
       if (!v && typeof cam.getVideoEncoderConfigurations === 'function') {
-        allEncoderConfigs = await new Promise((resolve, reject) =>
+        allEncoderConfigsRaw = await new Promise((resolve, reject) =>
           cam.getVideoEncoderConfigurations((err, result) => (err ? reject(err) : resolve(result)))
         )
 
-        const list = Array.isArray(allEncoderConfigs)
-          ? allEncoderConfigs
-          : allEncoderConfigs?.VideoEncoderConfigurations ||
-            allEncoderConfigs?.videoEncoderConfigurations ||
-            []
+        allEncoderConfigsList = normalizeEncoderConfigsList(allEncoderConfigsRaw)
 
-        function scoreCfg(c, profileName = '') {
-          const w = Number(c?.Resolution?.Width ?? null)
-          const h = Number(c?.Resolution?.Height ?? null)
-          const fps = Number(c?.RateControl?.FrameRateLimit ?? null)
-          const br = Number(c?.RateControl?.BitrateLimit ?? null)
-
-          let s = 0
-          if (w && h) s += (w * h) / 1000000
-          if (fps) s += 5
-          if (br) s += 5
-
-          const name = String(profileName || '').toLowerCase()
-          if (name.includes('mainstream')) s += w && h ? 10 : 0
-          if (name.includes('substream')) s -= w && h ? 5 : 0
-
-          return s
-        }
-
-        function pickBestConfig(list, profileName) {
-          const arr = Array.isArray(list) ? list : []
-          if (!arr.length) return null
-          return arr.map(c => ({c, s: scoreCfg(c, profileName)})).sort((a, b) => b.s - a.s)[0].c
-        }
-
-        if (Array.isArray(list) && list.length) {
-          v = pickBestConfig(list, p?.Name || p?.name || '')
+        if (allEncoderConfigsList.length) {
+          v = pickBestConfig(allEncoderConfigsList, p?.Name || p?.name || '')
           encoderSource = 'getVideoEncoderConfigurations'
         }
       }
     } catch (_) {}
 
-    // Normalizza ONVIF
+    // Normalizza ONVIF (con null corretti)
     const encoderNormalized = v
       ? {
           encoding: v?.Encoding || v?.encoding || null,
           resolution: {
-            width: Number(v?.Resolution?.Width ?? v?.resolution?.width ?? null),
-            height: Number(v?.Resolution?.Height ?? v?.resolution?.height ?? null),
+            width: toNumOrNull(v?.Resolution?.Width ?? v?.resolution?.width),
+            height: toNumOrNull(v?.Resolution?.Height ?? v?.resolution?.height),
           },
-          fps: Number(v?.RateControl?.FrameRateLimit ?? v?.rateControl?.frameRateLimit ?? null),
-          bitrate_kbps: Number(
-            v?.RateControl?.BitrateLimit ?? v?.rateControl?.bitrateLimit ?? null
-          ),
-          gop: Number(v?.GovLength ?? v?.govLength ?? v?.$?.GovLength ?? v?.$?.govLength ?? null),
+          fps: toNumOrNull(v?.RateControl?.FrameRateLimit ?? v?.rateControl?.frameRateLimit),
+          bitrate_kbps: toNumOrNull(v?.RateControl?.BitrateLimit ?? v?.rateControl?.bitrateLimit),
+          gop: toNumOrNull(v?.GovLength ?? v?.govLength ?? v?.$?.GovLength ?? v?.$?.govLength),
           raw: v,
         }
       : null
@@ -1629,12 +1640,12 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
         encoderNormalized.gop
       )
 
-    // 2) fallback Dahua solo se ONVIF è vuoto
+    // 2) fallback Dahua (solo se ONVIF non porta nulla di utile)
     let dahua = null
     if (encoderLooksEmpty) {
       try {
         const url = `http://${ip}:${+port}/cgi-bin/configManager.cgi?action=getConfig&name=Encode`
-        const text = await digestGetText(url, user, pass)
+        const text = await digestGetText(url, String(user), String(pass), {timeoutMs: 8000})
         const cfg = parseKeyValueBody(text)
         dahua = pickDahuaMainVideo(cfg)
       } catch (_) {}
@@ -1655,6 +1666,7 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
 
     const out = {
       ok: true,
+
       profile: {token, name: p?.Name || p?.name || null},
 
       encoder_source: !encoderLooksEmpty
@@ -1671,26 +1683,30 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
         hasVideoEncoderConfiguration: !!x?.VideoEncoderConfiguration,
       })),
 
-      encoder_configs: Array.isArray(allEncoderConfigs)
-        ? allEncoderConfigs.map(c => ({
+      // encoder_configs: SOLO se abbiamo davvero una lista encoder letta via getVideoEncoderConfigurations
+      encoder_configs: allEncoderConfigsList.length
+        ? allEncoderConfigsList.map(c => ({
             token: c?.$?.token || c?.token || null,
             encoding: c?.Encoding || c?.encoding || null,
-            width: Number(c?.Resolution?.Width ?? c?.resolution?.width ?? null),
-            height: Number(c?.Resolution?.Height ?? c?.resolution?.height ?? null),
-            fps: Number(c?.RateControl?.FrameRateLimit ?? c?.rateControl?.frameRateLimit ?? null),
-            bitrate_kbps: Number(
-              c?.RateControl?.BitrateLimit ?? c?.rateControl?.bitrateLimit ?? null
-            ),
+            width: toNumOrNull(c?.Resolution?.Width ?? c?.resolution?.width),
+            height: toNumOrNull(c?.Resolution?.Height ?? c?.resolution?.height),
+            fps: toNumOrNull(c?.RateControl?.FrameRateLimit ?? c?.rateControl?.frameRateLimit),
+            bitrate_kbps: toNumOrNull(c?.RateControl?.BitrateLimit ?? c?.rateControl?.bitrateLimit),
           }))
         : null,
 
       dahua_encode: dahua || null,
+
       options: null,
     }
 
-    // options (solo ONVIF)
+    // options (solo ONVIF, e solo se NON siamo in Dahua fallback)
     try {
-      if (typeof cam.getVideoEncoderConfigurationOptions === 'function' && v?.$?.token) {
+      if (
+        !encoderLooksEmpty &&
+        typeof cam.getVideoEncoderConfigurationOptions === 'function' &&
+        v?.$?.token
+      ) {
         const opts = await new Promise((resolve, reject) =>
           cam.getVideoEncoderConfigurationOptions(
             {configurationToken: v.$.token, profileToken: token},
