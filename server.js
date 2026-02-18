@@ -1443,6 +1443,95 @@ app.post('/v1/webcams/:id/snapshot/force-masked', async (req, res) => {
   }
 })
 
+app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
+  try {
+    const {ip, port = 80, user, pass, profileToken} = req.body || {}
+    if (!ip || !user || !pass) {
+      return res
+        .status(400)
+        .json({ok: false, error: 'bad_request', message: 'ip,user,pass obbligatori'})
+    }
+
+    const cam = await connectOnvif({
+      ip: String(ip),
+      port: +port,
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 9000,
+    })
+
+    const profiles = await new Promise((resolve, reject) =>
+      cam.getProfiles((err, result) => (err ? reject(err) : resolve(result)))
+    )
+
+    if (!profiles?.length) {
+      return res
+        .status(500)
+        .json({ok: false, error: 'no_profiles', message: 'Nessun profilo ONVIF trovato'})
+    }
+
+    const getToken = p => p?.$?.token || p?.token || null
+
+    // 1) se arriva profileToken, usa quello
+    // 2) altrimenti primo profilo con VideoEncoderConfiguration
+    // 3) altrimenti primo profilo
+    let p =
+      (profileToken && profiles.find(x => String(getToken(x)) === String(profileToken))) ||
+      profiles.find(x => x?.VideoEncoderConfiguration) ||
+      profiles[0]
+
+    const token = getToken(p)
+    const v = p?.VideoEncoderConfiguration || null
+
+    const out = {
+      ok: true,
+      profile: {token, name: p?.Name || p?.name || null},
+      encoder: v
+        ? {
+            encoding: v?.Encoding || v?.encoding || null,
+            resolution: {
+              width: Number(v?.Resolution?.Width ?? v?.resolution?.width ?? null),
+              height: Number(v?.Resolution?.Height ?? v?.resolution?.height ?? null),
+            },
+            fps: Number(v?.RateControl?.FrameRateLimit ?? v?.rateControl?.frameRateLimit ?? null),
+            bitrate_kbps: Number(
+              v?.RateControl?.BitrateLimit ?? v?.rateControl?.bitrateLimit ?? null
+            ),
+            gop: Number(v?.GovLength ?? v?.govLength ?? null),
+            raw: v,
+          }
+        : null,
+      profiles: profiles.map(x => ({
+        token: getToken(x),
+        name: x?.Name || x?.name || null,
+        hasVideoEncoderConfiguration: !!x?.VideoEncoderConfiguration,
+      })),
+      options: null,
+    }
+
+    // Opzionale: options (se la libreria lo supporta davvero)
+    try {
+      if (typeof cam.getVideoEncoderConfigurationOptions === 'function' && v?.$?.token) {
+        const opts = await new Promise((resolve, reject) =>
+          cam.getVideoEncoderConfigurationOptions(
+            {configurationToken: v.$.token, profileToken: token},
+            (err, result) => (err ? reject(err) : resolve(result))
+          )
+        )
+        out.options = opts || null
+      }
+    } catch (_) {}
+
+    return res.json(out)
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: 'onvif_encoder_error',
+      message: e?.message || String(e),
+    })
+  }
+})
+
 /* ────────────────────────────────────────────── */
 process.on('SIGTERM', () => {
   console.log('[PROC] SIGTERM received - shutting down')
