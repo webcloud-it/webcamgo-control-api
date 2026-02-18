@@ -1481,11 +1481,41 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
       profiles[0]
 
     const token = getToken(p)
-    const v = p?.VideoEncoderConfiguration || null
+    // ... dopo aver scelto `p` e `token` (profile token)
+    const vProfile = p?.VideoEncoderConfiguration || null
+
+    let v = vProfile
+    let encoderSource = vProfile ? 'profile.VideoEncoderConfiguration' : null
+    let allEncoderConfigs = null
+
+    // ✅ FALLBACK: GetVideoEncoderConfigurations (molte cam espongono qui)
+    try {
+      if (!v && typeof cam.getVideoEncoderConfigurations === 'function') {
+        allEncoderConfigs = await new Promise((resolve, reject) =>
+          cam.getVideoEncoderConfigurations((err, result) => (err ? reject(err) : resolve(result)))
+        )
+
+        // normalizza array
+        const list = Array.isArray(allEncoderConfigs)
+          ? allEncoderConfigs
+          : allEncoderConfigs?.VideoEncoderConfigurations ||
+            allEncoderConfigs?.videoEncoderConfigurations ||
+            []
+
+        if (Array.isArray(list) && list.length) {
+          v = list[0] // ✅ per ora: prima config
+          encoderSource = 'getVideoEncoderConfigurations'
+        }
+      }
+    } catch (_) {
+      // non deve rompere l’endpoint
+    }
 
     const out = {
       ok: true,
       profile: {token, name: p?.Name || p?.name || null},
+
+      encoder_source: encoderSource, // ✅ utile in UI
       encoder: v
         ? {
             encoding: v?.Encoding || v?.encoding || null,
@@ -1501,11 +1531,26 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
             raw: v,
           }
         : null,
+
+      // ✅ elenco profili come prima
       profiles: profiles.map(x => ({
         token: getToken(x),
         name: x?.Name || x?.name || null,
         hasVideoEncoderConfiguration: !!x?.VideoEncoderConfiguration,
       })),
+
+      // ✅ per debug (capisci se l’encoder c’è ma non matcha)
+      encoder_configs: Array.isArray(allEncoderConfigs)
+        ? allEncoderConfigs.map(c => ({
+            token: c?.$?.token || c?.token || null,
+            encoding: c?.Encoding || c?.encoding || null,
+            width: Number(c?.Resolution?.Width ?? null),
+            height: Number(c?.Resolution?.Height ?? null),
+            fps: Number(c?.RateControl?.FrameRateLimit ?? null),
+            bitrate_kbps: Number(c?.RateControl?.BitrateLimit ?? null),
+          }))
+        : null,
+
       options: null,
     }
 
