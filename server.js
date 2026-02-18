@@ -1502,8 +1502,32 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
             allEncoderConfigs?.videoEncoderConfigurations ||
             []
 
+        function scoreCfg(c, profileName = '') {
+          const w = Number(c?.Resolution?.Width ?? null)
+          const h = Number(c?.Resolution?.Height ?? null)
+          const fps = Number(c?.RateControl?.FrameRateLimit ?? null)
+          const br = Number(c?.RateControl?.BitrateLimit ?? null)
+
+          let s = 0
+          if (w && h) s += (w * h) / 1000000 // peso su megapixel
+          if (fps) s += 5
+          if (br) s += 5
+
+          const name = String(profileName || '').toLowerCase()
+          if (name.includes('mainstream')) s += w && h ? 10 : 0
+          if (name.includes('substream')) s -= w && h ? 5 : 0
+
+          return s
+        }
+
+        function pickBestConfig(list, profileName) {
+          const arr = Array.isArray(list) ? list : []
+          if (!arr.length) return null
+          return arr.map(c => ({c, s: scoreCfg(c, profileName)})).sort((a, b) => b.s - a.s)[0].c
+        }
+
         if (Array.isArray(list) && list.length) {
-          v = list[0] // ✅ per ora: prima config
+          v = pickBestConfig(list, p?.Name || p?.name || '')
           encoderSource = 'getVideoEncoderConfigurations'
         }
       }
