@@ -1452,12 +1452,14 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
         .json({ok: false, error: 'bad_request', message: 'ip,user,pass obbligatori'})
     }
 
-    const cam = await connectOnvif({
-      ip: String(ip),
-      port: +port,
-      user: String(user),
-      pass: String(pass),
-      timeoutMs: 9000,
+    const cam = await new Promise((resolve, reject) => {
+      new Cam(
+        {hostname: String(ip), username: String(user), password: String(pass), port: +port},
+        function (err) {
+          if (err) return reject(err)
+          resolve(this)
+        }
+      )
     })
 
     const profiles = await new Promise((resolve, reject) =>
@@ -1551,7 +1553,7 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
             bitrate_kbps: Number(
               v?.RateControl?.BitrateLimit ?? v?.rateControl?.bitrateLimit ?? null
             ),
-            gop: Number(v?.GovLength ?? v?.govLength ?? null),
+            gop: Number(v?.GovLength ?? v?.govLength ?? v?.$?.GovLength ?? v?.$?.govLength ?? null),
             raw: v,
           }
         : null,
@@ -1568,10 +1570,12 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
         ? allEncoderConfigs.map(c => ({
             token: c?.$?.token || c?.token || null,
             encoding: c?.Encoding || c?.encoding || null,
-            width: Number(c?.Resolution?.Width ?? null),
-            height: Number(c?.Resolution?.Height ?? null),
-            fps: Number(c?.RateControl?.FrameRateLimit ?? null),
-            bitrate_kbps: Number(c?.RateControl?.BitrateLimit ?? null),
+            width: Number(c?.Resolution?.Width ?? c?.resolution?.width ?? null),
+            height: Number(c?.Resolution?.Height ?? c?.resolution?.height ?? null),
+            fps: Number(c?.RateControl?.FrameRateLimit ?? c?.rateControl?.frameRateLimit ?? null),
+            bitrate_kbps: Number(
+              c?.RateControl?.BitrateLimit ?? c?.rateControl?.bitrateLimit ?? null
+            ),
           }))
         : null,
 
