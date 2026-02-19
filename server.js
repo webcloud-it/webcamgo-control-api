@@ -570,7 +570,7 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
       speed = 0.5,
       durationMs = 200,
       presetToken,
-      channel = 1, // per Dahua CGI spesso 1 sui dome
+      channel = 1,
     } = req.body || {}
 
     if (!ip || !user || !pass || !command) {
@@ -585,8 +585,7 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
     const m = String(mode).toLowerCase().trim()
     const cmd = String(command).toLowerCase().trim()
 
-    // ✅ durationMs: 0 significa "NON auto-stop" (stop esplicito dal client)
-    //    altrimenti clamp 50..2000 con default 200
+    // durationMs: 0 => NON auto-stop (stop esplicito dal client)
     const durRaw = req.body?.durationMs
     const durNum = durRaw === 0 ? 0 : Number(durRaw ?? 200)
     const shouldAutoStop = durNum !== 0
@@ -594,109 +593,55 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
       ? Math.max(50, Math.min(2000, Number.isFinite(durNum) ? durNum : 200))
       : 0
 
+    const ch = Math.max(1, parseInt(channel, 10) || 1)
+
     // ─────────────────────────────────────────────
-    // DAHUA CGI
+    // DAHUA CGI (robusto: usa Continuously)
     // ─────────────────────────────────────────────
     if (m === 'dahua_cgi' || b.includes('dahua')) {
       const base = normalizeBaseUrl(String(ip), port)
 
-      const dahuaCodeByCommand = {
-        left: 'Left',
-        right: 'Right',
-        up: 'Up',
-        down: 'Down',
-        zoom_in: 'ZoomTele',
-        zoom_out: 'ZoomWide',
-        goto_preset: 'GotoPreset',
-        goto_home: 'GotoPreset', // usa PresetId letto da PowerUp
+      // Mapping per "continuo":
+      // arg1 = pan  (neg=left, pos=right)   tipicamente oltre una soglia (doc: >4 / < -4)
+      // arg2 = tilt (pos=up,   neg=down)
+      // arg3 = zoom (range -100..100) :contentReference[oaicite:3]{index=3}
+      function buildContinuouslyArgs(cmd, speed01) {
+        // trasformo 0..1 in "step" compatibile (doc usa esempi tipo 5; soglie +/-4)
+        const s = Math.max(0.05, Math.min(1, Number(speed01) || 0.5))
+        const step = Math.max(5, Math.min(20, Math.round(s * 10))) // 5..20 (pratico)
+
+        let arg1 = 0,
+          arg2 = 0,
+          arg3 = 0
+        if (cmd === 'left') arg1 = -step
+        else if (cmd === 'right') arg1 = step
+        else if (cmd === 'up') arg2 = step
+        else if (cmd === 'down') arg2 = -step
+        else if (cmd === 'zoom_in') arg3 = step
+        else if (cmd === 'zoom_out') arg3 = -step
+        return {arg1, arg2, arg3}
       }
 
+      // STOP: stop dedicato per Continuously (molto più affidabile) :contentReference[oaicite:4]{index=4}
       if (cmd === 'stop') {
-        // Stop generico: su Dahua si fa chiamando ptz.cgi?action=stop con stesso code
-        // Qui usiamo "Left" come placeholder (alcuni firmware lo ignorano e stoppa comunque).
-        const stopUrl = `${base}/cgi-bin/ptz.cgi?action=stop&channel=${channel}&code=Left&arg1=0&arg2=0&arg3=0`
-        const r = await fetchWithBasicOrDigest(stopUrl, {user, pass, timeoutMs: 7000})
-        if (!r.ok) return res.status(500).json({ok: false, error: 'ptz_failed', status: r.status})
-        return res.json({ok: true, via: 'dahua_cgi', command: 'stop'})
-      }
+        const stopUrl =
+          `${base}/cgi-bin/ptz.cgi?action=stop` +
+          `&code=Continuously&channel=${ch}&arg1=0&arg2=0&arg3=0&arg4=0`
 
-      const code = dahuaCodeByCommand[cmd]
-      if (!code) {
-        return res.status(400).json({
-          ok: false,
-          error: 'bad_request',
-          message: 'command non supportato per dahua_cgi',
-          debug: {receivedCommand: command, normalized: cmd},
-        })
-      }
-
-      const sp = Math.max(1, Math.min(8, Math.round(Number(speed) * 8 || 4))) // 1..8
-      const isZoom = code === 'ZoomTele' || code === 'ZoomWide'
-
-      let arg1 = 0,
-        arg2 = isZoom ? sp : 0,
-        arg3 = isZoom ? 0 : sp
-
-      // goto_home: legge PowerUp PresetId e chiama GotoPreset
-      if (cmd === 'goto_home') {
-        const cfg = await getDahuaPowerUpPresetId(base, {user, pass})
-        if (!cfg.ok) {
+        const r = await fetchWithBasicOrDigest(stopUrl, {user, pass, timeoutMs: 8000})
+        const text = await r.text().catch(() => '')
+        if (!r.ok) {
           return res.status(502).json({
             ok: false,
             error: 'ptz_failed',
-            message: 'impossibile leggere PresetId da Ptz.PtzPowerUp',
-            detail: {status: cfg.status, text: cfg.text},
+            status: r.status,
+            detail: text.slice(0, 300),
           })
         }
-
-        const presetId = String(cfg.presetId)
-
-        const urlArg2 =
-          `${base}/cgi-bin/ptz.cgi?action=start` +
-          `&channel=${channel}&code=GotoPreset&arg1=0&arg2=${encodeURIComponent(presetId)}&arg3=0`
-
-        const urlArg3 =
-          `${base}/cgi-bin/ptz.cgi?action=start` +
-          `&channel=${channel}&code=GotoPreset&arg1=0&arg2=0&arg3=${encodeURIComponent(presetId)}`
-
-        const r2 = await fetchWithBasicOrDigest(urlArg2, {user, pass, timeoutMs: 8000})
-        if (r2.ok) {
-          return res.json({
-            ok: true,
-            via: 'dahua_cgi',
-            command: 'goto_home',
-            presetId,
-            variant: 'arg2',
-          })
-        }
-
-        const r3 = await fetchWithBasicOrDigest(urlArg3, {user, pass, timeoutMs: 8000})
-        if (r3.ok) {
-          return res.json({
-            ok: true,
-            via: 'dahua_cgi',
-            command: 'goto_home',
-            presetId,
-            variant: 'arg3',
-            note: 'fallback (arg2 non accettato dal firmware)',
-          })
-        }
-
-        const t2 = await r2.text().catch(() => '')
-        const t3 = await r3.text().catch(() => '')
-        return res.status(502).json({
-          ok: false,
-          error: 'ptz_failed',
-          message: 'GotoPreset fallito anche dopo lettura PresetId',
-          detail: {
-            presetId,
-            arg2: {status: r2.status, text: t2.slice(0, 300)},
-            arg3: {status: r3.status, text: t3.slice(0, 300)},
-          },
-        })
+        return res.json({ok: true, via: 'dahua_cgi', command: 'stop'})
       }
 
-      // goto_preset: usa presetToken e prova arg2, poi arg3
+      // Preset: mantengo il tuo GotoPreset (qui NON uso Continuously)
       if (cmd === 'goto_preset') {
         if (presetToken == null) {
           return res
@@ -704,86 +649,111 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
             .json({ok: false, error: 'bad_request', message: 'presetToken obbligatorio'})
         }
 
+        // In doc/implementazioni reali si usa spesso arg2=preset (con arg1=0,arg3=0) :contentReference[oaicite:5]{index=5}
         const urlA =
-          `${base}/cgi-bin/ptz.cgi?action=start` +
-          `&channel=${channel}&code=GotoPreset&arg1=0&arg2=${encodeURIComponent(
-            String(presetToken)
-          )}&arg3=0`
-
-        const urlB =
-          `${base}/cgi-bin/ptz.cgi?action=start` +
-          `&channel=${channel}&code=GotoPreset&arg1=0&arg2=0&arg3=${encodeURIComponent(
-            String(presetToken)
-          )}`
+          `${base}/cgi-bin/ptz.cgi?action=start&channel=${ch}` +
+          `&code=GotoPreset&arg1=0&arg2=${encodeURIComponent(String(presetToken))}&arg3=0`
 
         const rA = await fetchWithBasicOrDigest(urlA, {user, pass, timeoutMs: 8000})
-        if (rA.ok) {
-          return res.json({
-            ok: true,
-            via: 'dahua_cgi',
-            command: 'goto_preset',
-            presetToken: String(presetToken),
-            variant: 'arg2',
-          })
-        }
-
-        const rB = await fetchWithBasicOrDigest(urlB, {user, pass, timeoutMs: 8000})
-        if (rB.ok) {
-          return res.json({
-            ok: true,
-            via: 'dahua_cgi',
-            command: 'goto_preset',
-            presetToken: String(presetToken),
-            variant: 'arg3',
-          })
-        }
-
         const tA = await rA.text().catch(() => '')
-        const tB = await rB.text().catch(() => '')
-        return res.status(500).json({
-          ok: false,
-          error: 'ptz_failed',
-          detail: {
-            arg2: {status: rA.status, text: tA.slice(0, 300)},
-            arg3: {status: rB.status, text: tB.slice(0, 300)},
-          },
+        if (!rA.ok) {
+          return res.status(502).json({
+            ok: false,
+            error: 'ptz_failed',
+            status: rA.status,
+            detail: tA.slice(0, 300),
+          })
+        }
+
+        return res.json({
+          ok: true,
+          via: 'dahua_cgi',
+          command: 'goto_preset',
+          presetToken: String(presetToken),
         })
       }
 
-      // comandi direzionali / zoom (start)
+      if (cmd === 'goto_home') {
+        const cfg = await getDahuaPowerUpPresetId(base, {user, pass})
+        if (!cfg.ok) {
+          return res.status(502).json({
+            ok: false,
+            error: 'ptz_failed',
+            message: 'impossibile leggere PresetId da PtzPowerUp',
+            detail: {status: cfg.status, text: cfg.text},
+          })
+        }
+
+        const presetId = String(cfg.presetId)
+        const url =
+          `${base}/cgi-bin/ptz.cgi?action=start&channel=${ch}` +
+          `&code=GotoPreset&arg1=0&arg2=${encodeURIComponent(presetId)}&arg3=0`
+
+        const r = await fetchWithBasicOrDigest(url, {user, pass, timeoutMs: 8000})
+        const text = await r.text().catch(() => '')
+        if (!r.ok) {
+          return res.status(502).json({
+            ok: false,
+            error: 'ptz_failed',
+            status: r.status,
+            detail: text.slice(0, 300),
+          })
+        }
+
+        return res.json({ok: true, via: 'dahua_cgi', command: 'goto_home', presetId})
+      }
+
+      // Direzioni / zoom: START Continuously :contentReference[oaicite:6]{index=6}
+      const supported = new Set(['left', 'right', 'up', 'down', 'zoom_in', 'zoom_out'])
+      if (!supported.has(cmd)) {
+        return res
+          .status(400)
+          .json({ok: false, error: 'bad_request', message: 'command non supportato (dahua_cgi)'})
+      }
+
+      const {arg1, arg2, arg3} = buildContinuouslyArgs(cmd, speed)
+      const overtimeSeconds = shouldAutoStop
+        ? Math.max(1, Math.min(3, Math.ceil(holdMs / 1000)))
+        : 60
+
       const startUrl =
         `${base}/cgi-bin/ptz.cgi?action=start` +
-        `&channel=${channel}&code=${encodeURIComponent(code)}` +
-        `&arg1=${encodeURIComponent(arg1)}&arg2=${encodeURIComponent(arg2)}&arg3=${encodeURIComponent(arg3)}`
+        `&code=Continuously&channel=${ch}` +
+        `&arg1=${encodeURIComponent(String(arg1))}` +
+        `&arg2=${encodeURIComponent(String(arg2))}` +
+        `&arg3=${encodeURIComponent(String(arg3))}` +
+        `&arg4=${encodeURIComponent(String(overtimeSeconds))}`
 
-      const stopUrl = startUrl.replace('action=start', 'action=stop')
-
-      const r1 = await fetchWithBasicOrDigest(startUrl, {user, pass, timeoutMs: 7000})
+      const r1 = await fetchWithBasicOrDigest(startUrl, {user, pass, timeoutMs: 8000})
+      const t1 = await r1.text().catch(() => '')
       if (!r1.ok) {
-        const text = await r1.text().catch(() => '')
-        console.log('[PTZ][DAHUA] FAIL', {
+        return res.status(502).json({
+          ok: false,
+          error: 'ptz_failed',
           status: r1.status,
-          startUrl,
-          text: text.slice(0, 300),
+          detail: t1.slice(0, 300),
+          debug: {startUrl},
         })
-        return res
-          .status(502)
-          .json({ok: false, error: 'ptz_failed', status: r1.status, detail: text?.slice(0, 300)})
       }
 
-      // ✅ auto-stop SOLO se richiesto (durationMs !== 0)
-      if (shouldAutoStop) {
-        setTimeout(() => {
-          fetchWithBasicOrDigest(stopUrl, {user, pass, timeoutMs: 7000}).catch(() => {})
-        }, holdMs)
+      if (!shouldAutoStop) {
+        return res.json({ok: true, via: 'dahua_cgi', command: cmd, autoStop: false})
       }
+
+      // auto-stop (se richiesto)
+      setTimeout(() => {
+        const stopUrl =
+          `${base}/cgi-bin/ptz.cgi?action=stop` +
+          `&code=Continuously&channel=${ch}&arg1=0&arg2=0&arg3=0&arg4=0`
+        fetchWithBasicOrDigest(stopUrl, {user, pass, timeoutMs: 8000}).catch(() => {})
+      }, holdMs)
 
       return res.json({
         ok: true,
         via: 'dahua_cgi',
         command: cmd,
-        autoStop: shouldAutoStop,
-        durationMs: shouldAutoStop ? holdMs : 0,
+        autoStop: true,
+        durationMs: holdMs,
       })
     }
 
@@ -808,11 +778,13 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
 
     if (cmd === 'goto_preset') {
       if (presetToken == null) {
-        return res.status(400).json({
-          ok: false,
-          error: 'bad_request',
-          message: 'presetToken obbligatorio per goto_preset',
-        })
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error: 'bad_request',
+            message: 'presetToken obbligatorio per goto_preset',
+          })
       }
       await new Promise((resolve, reject) =>
         cam.gotoPreset({profileToken, presetToken: String(presetToken)}, err =>
@@ -827,10 +799,7 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
       })
     }
 
-    // relativeMove: translation normalizzata -1..1
     const s = Math.max(0.05, Math.min(1, Number(speed) || 0.5))
-
-    // ✅ SEMPRE completa (molte cam sono più stabili così)
     const translation = {x: 0, y: 0, zoom: 0}
 
     if (cmd === 'left') translation.x = -s
@@ -849,30 +818,16 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
       cam.relativeMove({profileToken, translation}, err => (err ? reject(err) : resolve()))
     )
 
-    // ✅ se durationMs === 0: NON auto-stop (stop esplicito dal client)
     if (!shouldAutoStop) {
-      return res.json({
-        ok: true,
-        via: 'onvif',
-        command: cmd,
-        autoStop: false,
-        durationMs: 0,
-      })
+      return res.json({ok: true, via: 'onvif', command: cmd, autoStop: false})
     }
 
     await sleep(holdMs)
-
     await new Promise((resolve, reject) =>
       cam.stop({profileToken, panTilt: true, zoom: true}, err => (err ? reject(err) : resolve()))
     )
 
-    return res.json({
-      ok: true,
-      via: 'onvif',
-      command: cmd,
-      autoStop: true,
-      durationMs: holdMs,
-    })
+    return res.json({ok: true, via: 'onvif', command: cmd, autoStop: true, durationMs: holdMs})
   } catch (e) {
     return res.status(500).json({ok: false, error: 'ptz_error', message: e?.message || String(e)})
   }
