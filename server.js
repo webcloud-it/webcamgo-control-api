@@ -585,7 +585,18 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
     const m = String(mode).toLowerCase().trim()
     const cmd = String(command).toLowerCase().trim()
 
-    // ── Dahua CGI PTZ (start + stop automatico)
+    // ✅ durationMs: 0 significa "NON auto-stop" (stop esplicito dal client)
+    //    altrimenti clamp 50..2000 con default 200
+    const durRaw = req.body?.durationMs
+    const durNum = durRaw === 0 ? 0 : Number(durRaw ?? 200)
+    const shouldAutoStop = durNum !== 0
+    const holdMs = shouldAutoStop
+      ? Math.max(50, Math.min(2000, Number.isFinite(durNum) ? durNum : 200))
+      : 0
+
+    // ─────────────────────────────────────────────
+    // DAHUA CGI
+    // ─────────────────────────────────────────────
     if (m === 'dahua_cgi' || b.includes('dahua')) {
       const base = normalizeBaseUrl(String(ip), port)
 
@@ -626,6 +637,7 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
         arg2 = isZoom ? sp : 0,
         arg3 = isZoom ? 0 : sp
 
+      // goto_home: legge PowerUp PresetId e chiama GotoPreset
       if (cmd === 'goto_home') {
         const cfg = await getDahuaPowerUpPresetId(base, {user, pass})
         if (!cfg.ok) {
@@ -684,6 +696,7 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
         })
       }
 
+      // goto_preset: usa presetToken e prova arg2, poi arg3
       if (cmd === 'goto_preset') {
         if (presetToken == null) {
           return res
@@ -691,15 +704,17 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
             .json({ok: false, error: 'bad_request', message: 'presetToken obbligatorio'})
         }
 
-        // Variante A (come non-VPN): preset in arg2
         const urlA =
           `${base}/cgi-bin/ptz.cgi?action=start` +
-          `&channel=${channel}&code=GotoPreset&arg1=0&arg2=${encodeURIComponent(String(presetToken))}&arg3=0`
+          `&channel=${channel}&code=GotoPreset&arg1=0&arg2=${encodeURIComponent(
+            String(presetToken)
+          )}&arg3=0`
 
-        // Variante B: preset in arg3
         const urlB =
           `${base}/cgi-bin/ptz.cgi?action=start` +
-          `&channel=${channel}&code=GotoPreset&arg1=0&arg2=0&arg3=${encodeURIComponent(String(presetToken))}`
+          `&channel=${channel}&code=GotoPreset&arg1=0&arg2=0&arg3=${encodeURIComponent(
+            String(presetToken)
+          )}`
 
         const rA = await fetchWithBasicOrDigest(urlA, {user, pass, timeoutMs: 8000})
         if (rA.ok) {
@@ -735,6 +750,7 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
         })
       }
 
+      // comandi direzionali / zoom (start)
       const startUrl =
         `${base}/cgi-bin/ptz.cgi?action=start` +
         `&channel=${channel}&code=${encodeURIComponent(code)}` +
@@ -755,20 +771,25 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
           .json({ok: false, error: 'ptz_failed', status: r1.status, detail: text?.slice(0, 300)})
       }
 
-      // stop automatico (non per goto_preset, dove spesso non serve)
-      if (cmd !== 'goto_preset') {
-        setTimeout(
-          () => {
-            fetchWithBasicOrDigest(stopUrl, {user, pass, timeoutMs: 7000}).catch(() => {})
-          },
-          Math.max(50, Math.min(2000, Number(durationMs) || 200))
-        )
+      // ✅ auto-stop SOLO se richiesto (durationMs !== 0)
+      if (shouldAutoStop) {
+        setTimeout(() => {
+          fetchWithBasicOrDigest(stopUrl, {user, pass, timeoutMs: 7000}).catch(() => {})
+        }, holdMs)
       }
 
-      return res.json({ok: true, via: 'dahua_cgi', command: cmd})
+      return res.json({
+        ok: true,
+        via: 'dahua_cgi',
+        command: cmd,
+        autoStop: shouldAutoStop,
+        durationMs: shouldAutoStop ? holdMs : 0,
+      })
     }
 
-    // ── ONVIF PTZ (relativeMove / stop / gotoPreset)
+    // ─────────────────────────────────────────────
+    // ONVIF
+    // ─────────────────────────────────────────────
     const cam = await connectOnvif({
       ip: String(ip),
       port: +port,
@@ -808,7 +829,9 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
 
     // relativeMove: translation normalizzata -1..1
     const s = Math.max(0.05, Math.min(1, Number(speed) || 0.5))
-    const translation = {}
+
+    // ✅ SEMPRE completa (molte cam sono più stabili così)
+    const translation = {x: 0, y: 0, zoom: 0}
 
     if (cmd === 'left') translation.x = -s
     else if (cmd === 'right') translation.x = s
@@ -826,13 +849,30 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
       cam.relativeMove({profileToken, translation}, err => (err ? reject(err) : resolve()))
     )
 
-    // stop automatico
-    await sleep(Math.max(50, Math.min(2000, Number(durationMs) || 200)))
+    // ✅ se durationMs === 0: NON auto-stop (stop esplicito dal client)
+    if (!shouldAutoStop) {
+      return res.json({
+        ok: true,
+        via: 'onvif',
+        command: cmd,
+        autoStop: false,
+        durationMs: 0,
+      })
+    }
+
+    await sleep(holdMs)
+
     await new Promise((resolve, reject) =>
       cam.stop({profileToken, panTilt: true, zoom: true}, err => (err ? reject(err) : resolve()))
     )
 
-    return res.json({ok: true, via: 'onvif', command: cmd})
+    return res.json({
+      ok: true,
+      via: 'onvif',
+      command: cmd,
+      autoStop: true,
+      durationMs: holdMs,
+    })
   } catch (e) {
     return res.status(500).json({ok: false, error: 'ptz_error', message: e?.message || String(e)})
   }
