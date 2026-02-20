@@ -778,13 +778,11 @@ app.post('/v1/webcams/:id/ptz', async (req, res) => {
 
     if (cmd === 'goto_preset') {
       if (presetToken == null) {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error: 'bad_request',
-            message: 'presetToken obbligatorio per goto_preset',
-          })
+        return res.status(400).json({
+          ok: false,
+          error: 'bad_request',
+          message: 'presetToken obbligatorio per goto_preset',
+        })
       }
       await new Promise((resolve, reject) =>
         cam.gotoPreset({profileToken, presetToken: String(presetToken)}, err =>
@@ -1535,27 +1533,55 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
       return []
     }
 
-    function scoreCfg(c, profileName = '') {
+    function scoreCfg(c, profileName = '', cfgName = '') {
       const w = toNumOrNull(c?.Resolution?.Width ?? c?.resolution?.width)
       const h = toNumOrNull(c?.Resolution?.Height ?? c?.resolution?.height)
       const fps = toNumOrNull(c?.RateControl?.FrameRateLimit ?? c?.rateControl?.frameRateLimit)
       const br = toNumOrNull(c?.RateControl?.BitrateLimit ?? c?.rateControl?.bitrateLimit)
 
+      const pName = String(profileName || '').toLowerCase()
+      const cName = String(cfgName || c?.Name || c?.name || '').toLowerCase()
+
+      // Base score “per tipo stream”
+      // (molto forte: deve impedire che un Sub venga scelto quando chiediamo Main)
       let s = 0
-      if (w && h) s += (w * h) / 1000000
+
+      const profileIsMain = pName.includes('mainstream')
+      const profileIsSub = pName.includes('substream')
+
+      const cfgIsMain = cName.includes('mainstream')
+      const cfgIsSub = cName.includes('substream')
+
+      if (profileIsMain) {
+        if (cfgIsMain) s += 100
+        if (cfgIsSub) s -= 200
+      } else if (profileIsSub) {
+        if (cfgIsSub) s += 100
+        if (cfgIsMain) s -= 200
+      } else {
+        // profilo “neutro”: comunque preferisci Main rispetto a Sub
+        if (cfgIsMain) s += 30
+        if (cfgIsSub) s -= 30
+      }
+
+      // Poi aggiungi qualità tecnica (se disponibile)
+      if (w && h) s += (w * h) / 1_000_000
       if (fps) s += 5
       if (br) s += 5
 
-      const name = String(profileName || '').toLowerCase()
-      if (name.includes('mainstream')) s += w && h ? 10 : 0
-      if (name.includes('substream')) s -= w && h ? 5 : 0
       return s
     }
 
     function pickBestConfig(list, profileName) {
       const arr = Array.isArray(list) ? list : []
       if (!arr.length) return null
-      return arr.map(c => ({c, s: scoreCfg(c, profileName)})).sort((a, b) => b.s - a.s)[0].c
+
+      return arr
+        .map(c => {
+          const cfgName = c?.Name || c?.name || ''
+          return {c, s: scoreCfg(c, profileName, cfgName)}
+        })
+        .sort((a, b) => b.s - a.s)[0].c
     }
 
     const cam = await new Promise((resolve, reject) => {
