@@ -5,6 +5,7 @@ const cors = require('cors')
 const crypto = require('crypto')
 const {Cam} = require('onvif')
 const {fetch} = require('undici')
+const net = require('net')
 
 const app = express()
 app.set('trust proxy', 1)
@@ -345,6 +346,25 @@ async function digestGetText(url, user, pass, {timeoutMs = 8000, headers = {}} =
     throw err
   }
   return text
+}
+
+function tcpPing(host, port = 80, timeoutMs = 3000) {
+  return new Promise(resolve => {
+    const socket = new net.Socket()
+    let ok = false
+
+    socket.setTimeout(timeoutMs)
+
+    socket.once('connect', () => {
+      ok = true
+      socket.destroy()
+    })
+    socket.once('timeout', () => socket.destroy())
+    socket.once('error', () => {}) // ok resta false
+    socket.once('close', () => resolve(ok))
+
+    socket.connect(port, host)
+  })
 }
 
 app.get('/v1/health', (req, res) => {
@@ -1743,6 +1763,28 @@ app.post('/v1/webcams/:id/onvif/media/encoder', async (req, res) => {
     return res
       .status(500)
       .json({ok: false, error: 'onvif_encoder_error', message: e?.message || String(e)})
+  }
+})
+
+app.post('/v1/connectivity/check', async (req, res) => {
+  try {
+    const target = String(req.body?.target || '').trim()
+    const port = Number(req.body?.port ?? 80)
+    const timeoutMs = Number(req.body?.timeoutMs ?? 3000)
+
+    if (!target) {
+      return res.status(400).json({ok: false, error: 'bad_request', message: 'target obbligatorio'})
+    }
+    if (!Number.isFinite(port) || port <= 0) {
+      return res.status(400).json({ok: false, error: 'bad_request', message: 'port non valido'})
+    }
+
+    const reachable = await tcpPing(target, port, timeoutMs)
+    return res.json({ok: true, reachable})
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ok: false, error: 'connectivity_error', message: e?.message || String(e)})
   }
 })
 
