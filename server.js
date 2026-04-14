@@ -367,6 +367,70 @@ function tcpPing(host, port = 80, timeoutMs = 3000) {
   })
 }
 
+async function readDahuaConfig(base, {user, pass, name, timeoutMs = 8000}) {
+  const url = `${base}/cgi-bin/configManager.cgi?action=getConfig&name=${encodeURIComponent(name)}`
+  const r = await fetchWithBasicOrDigest(url, {
+    method: 'GET',
+    user,
+    pass,
+    timeoutMs,
+    headers: {Accept: 'text/plain,*/*'},
+  })
+
+  const text = await r.text().catch(() => '')
+
+  if (!r.ok) {
+    return {
+      ok: false,
+      name,
+      status: r.status,
+      raw: text?.slice(0, 1000) || '',
+      parsed: null,
+    }
+  }
+
+  const parsed = parseKeyValueBody(text)
+
+  return {
+    ok: true,
+    name,
+    status: r.status,
+    raw: text,
+    parsed,
+  }
+}
+
+async function readFirstAvailableDahuaConfig(base, {user, pass, names = [], timeoutMs = 8000}) {
+  const attempts = []
+
+  for (const name of names.filter(Boolean)) {
+    const result = await readDahuaConfig(base, {user, pass, name, timeoutMs})
+
+    attempts.push({
+      name: result.name,
+      ok: result.ok,
+      status: result.status,
+      hasKeys: !!Object.keys(result.parsed || {}).length,
+    })
+
+    if (result.ok && Object.keys(result.parsed || {}).length > 0) {
+      return {
+        ok: true,
+        selected: result,
+        attempts,
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    selected: null,
+    attempts,
+  }
+}
+
+// ─────────────────────────────────────────────
+
 app.get('/v1/health', (req, res) => {
   res.json({ok: true, service: 'webcamgo-control-api'})
 })
@@ -1785,6 +1849,87 @@ app.post('/v1/connectivity/check', async (req, res) => {
     return res
       .status(500)
       .json({ok: false, error: 'connectivity_error', message: e?.message || String(e)})
+  }
+})
+
+app.post('/v1/webcams/:id/maintenance/reboot/read', async (req, res) => {
+  try {
+    const {
+      ip,
+      port = 80,
+      user,
+      pass,
+      brand = '',
+      mode = '',
+      cfgName,
+      cfgNames = [],
+      timeoutMs = 8000,
+    } = req.body || {}
+
+    if (!ip || !user || !pass) {
+      return res.status(400).json({
+        ok: false,
+        error: 'bad_request',
+        message: 'ip,user,pass obbligatori',
+      })
+    }
+
+    const b = String(brand).toLowerCase().trim()
+    const m = String(mode).toLowerCase().trim()
+
+    if (m === 'dahua_cgi' || b.includes('dahua')) {
+      const base = normalizeBaseUrl(String(ip), port)
+
+      const names = [cfgName, ...(Array.isArray(cfgNames) ? cfgNames : [])]
+        .filter(Boolean)
+        .map(x => String(x).trim())
+        .filter(Boolean)
+
+      if (!names.length) {
+        return res.status(400).json({
+          ok: false,
+          error: 'bad_request',
+          message: 'cfgName o cfgNames obbligatori per questa prima versione',
+        })
+      }
+
+      const result = await readFirstAvailableDahuaConfig(base, {
+        user: String(user),
+        pass: String(pass),
+        names,
+        timeoutMs: Number(timeoutMs) || 8000,
+      })
+
+      if (!result.ok || !result.selected) {
+        return res.status(404).json({
+          ok: false,
+          error: 'config_not_found',
+          message: 'Nessuna configurazione valida trovata',
+          attempts: result.attempts,
+        })
+      }
+
+      return res.json({
+        ok: true,
+        via: 'dahua_cgi',
+        config_name: result.selected.name,
+        raw: result.selected.raw,
+        parsed: result.selected.parsed,
+        attempts: result.attempts,
+      })
+    }
+
+    return res.status(400).json({
+      ok: false,
+      error: 'unsupported',
+      message: 'Prima versione disponibile solo per webcam Dahua via CGI',
+    })
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: 'maintenance_reboot_read_error',
+      message: e?.message || String(e),
+    })
   }
 })
 
