@@ -2032,7 +2032,7 @@ async function loadTrafficLimitsByAccessIds(webcamAccessIds) {
       query TrafficLimits($webcamAccessIds: [uuid!]!) {
         mikrotik_traffic_limits(
           where: {webcam_access_id: {_in: $webcamAccessIds}}
-          order_by: {date_created: desc}
+          order_by: {created_at: desc}
         ) {
           id
           webcam_access_id
