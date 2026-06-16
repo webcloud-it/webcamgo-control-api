@@ -1933,103 +1933,197 @@ app.post('/v1/webcams/:id/maintenance/reboot/read', async (req, res) => {
   }
 })
 
-app.post('/v1/mikrotik/traffic/read', async (req, res) => {
-  try {
-    const {
-      ip,
-      port = 80,
-      user,
-      pass,
-      interfaceName,
-      timeoutMs = 8000,
-      protocol = 'http',
-    } = req.body || {}
+async function fetchHasura(query, variables = {}) {
+  const endpoint = process.env.WEBCAMGO_API_ENDPOINT
+  const secret = process.env.WEBCAMGO_API_SECRET || process.env.HASURA_ADMIN_SECRET
 
-    if (!ip || !user || !pass || !interfaceName) {
-      return res.status(400).json({
-        ok: false,
-        error: 'bad_request',
-        message: 'ip,user,pass,interfaceName obbligatori',
-      })
+  if (!endpoint || !secret) {
+    throw new Error('WEBCAMGO_API_ENDPOINT / WEBCAMGO_API_SECRET mancanti')
+  }
+
+  const r = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-hasura-admin-secret': secret,
+    },
+    body: JSON.stringify({query, variables}),
+  })
+
+  const json = await r.json().catch(() => null)
+
+  if (!r.ok || json?.errors) {
+    throw new Error(JSON.stringify(json?.errors || json || {status: r.status}))
+  }
+
+  return json
+}
+
+async function readMikrotikTraffic({ip, port = 80, user, pass, interfaceName, protocol = 'http'}) {
+  const scheme = String(protocol).toLowerCase() === 'https' ? 'https' : 'http'
+  const base = normalizeBaseUrl(`${scheme}://${String(ip)}`, port)
+  const url = `${base}/rest/interface`
+
+  const r = await fetchWithBasicOrDigest(url, {
+    method: 'GET',
+    user: String(user),
+    pass: String(pass),
+    timeoutMs: 8000,
+    headers: {Accept: 'application/json'},
+  })
+
+  const text = await r.text().catch(() => '')
+
+  if (!r.ok) {
+    throw new Error(`MikroTik REST HTTP ${r.status}: ${text.slice(0, 300)}`)
+  }
+
+  const interfaces = JSON.parse(text)
+  const iface = Array.isArray(interfaces)
+    ? interfaces.find(item => String(item.name || '') === String(interfaceName))
+    : null
+
+  if (!iface) {
+    throw new Error(`Interfaccia "${interfaceName}" non trovata`)
+  }
+
+  const rxBytes = Number(iface['rx-byte'] ?? iface.rx_byte ?? 0)
+  const txBytes = Number(iface['tx-byte'] ?? iface.tx_byte ?? 0)
+
+  if (!Number.isFinite(rxBytes) || !Number.isFinite(txBytes)) {
+    throw new Error('Contatori rx-byte/tx-byte non disponibili')
+  }
+
+  return {
+    interface_name: String(interfaceName),
+    rx_bytes: rxBytes,
+    tx_bytes: txBytes,
+    total_bytes: rxBytes + txBytes,
+    raw: iface,
+  }
+}
+
+async function loadTrafficLimits() {
+  const result = await fetchHasura(/* GraphQL */ `
+    query TrafficLimits {
+      mikrotik_traffic_limits(where: {enabled: {_eq: true}}) {
+        id
+        webcam_access_id
+        interface_name
+        monthly_limit_gb
+        reset_day
+        timezone
+        warning_threshold_1
+        warning_threshold_2
+        warning_threshold_3
+        webcam_access {
+          id
+          mikrotik_vpn_ip
+          mikrotik_user
+          mikrotik_password
+        }
+      }
     }
+  `)
 
-    const scheme = String(protocol).toLowerCase() === 'https' ? 'https' : 'http'
-    const base = normalizeBaseUrl(`${scheme}://${String(ip)}`, port)
+  return result?.data?.mikrotik_traffic_limits || []
+}
 
-    const interfacesUrl = `${base}/rest/interface`
-    const r = await fetchWithBasicOrDigest(interfacesUrl, {
-      method: 'GET',
-      user: String(user),
-      pass: String(pass),
-      timeoutMs: Number(timeoutMs) || 8000,
-      headers: {Accept: 'application/json'},
-    })
-
-    const text = await r.text().catch(() => '')
-
-    if (!r.ok) {
-      return res.status(502).json({
-        ok: false,
-        error: 'mikrotik_rest_failed',
-        status: r.status,
-        detail: text.slice(0, 500),
-      })
+async function insertTrafficLog({limit, traffic}) {
+  const result = await fetchHasura(
+    /* GraphQL */ `
+      mutation InsertTrafficLog($object: mikrotik_traffic_logs_insert_input!) {
+        insert_mikrotik_traffic_logs_one(object: $object) {
+          id
+          logged_at
+        }
+      }
+    `,
+    {
+      object: {
+        webcam_access_id: limit.webcam_access_id,
+        interface_name: traffic.interface_name,
+        rx_bytes: String(traffic.rx_bytes),
+        tx_bytes: String(traffic.tx_bytes),
+        total_bytes: String(traffic.total_bytes),
+        logged_at: new Date().toISOString(),
+        meta: traffic.raw,
+      },
     }
+  )
 
-    let interfaces
+  return result?.data?.insert_mikrotik_traffic_logs_one || null
+}
+
+async function collectMikrotikTraffic() {
+  const limits = await loadTrafficLimits()
+  const results = []
+
+  for (const limit of limits) {
     try {
-      interfaces = JSON.parse(text)
-    } catch (_) {
-      return res.status(502).json({
+      const access = limit.webcam_access
+
+      if (!access?.mikrotik_vpn_ip || !access?.mikrotik_user || !access?.mikrotik_password) {
+        throw new Error('Dati MikroTik mancanti su webcam_access')
+      }
+
+      const traffic = await readMikrotikTraffic({
+        ip: access.mikrotik_vpn_ip,
+        port: Number(process.env.MIKROTIK_REST_PORT || 80),
+        user: access.mikrotik_user,
+        pass: access.mikrotik_password,
+        interfaceName: limit.interface_name || 'lte1',
+        protocol: process.env.MIKROTIK_REST_PROTOCOL || 'http',
+      })
+
+      const log = await insertTrafficLog({limit, traffic})
+
+      results.push({
+        ok: true,
+        limit_id: limit.id,
+        webcam_access_id: limit.webcam_access_id,
+        interface_name: traffic.interface_name,
+        rx_bytes: traffic.rx_bytes,
+        tx_bytes: traffic.tx_bytes,
+        total_bytes: traffic.total_bytes,
+        log_id: log?.id || null,
+      })
+    } catch (e) {
+      results.push({
         ok: false,
-        error: 'invalid_json',
-        message: 'Risposta MikroTik REST non JSON',
-        detail: text.slice(0, 500),
+        limit_id: limit.id,
+        webcam_access_id: limit.webcam_access_id,
+        error: e?.message || String(e),
       })
     }
+  }
 
-    const targetName = String(interfaceName).trim()
-    const iface = Array.isArray(interfaces)
-      ? interfaces.find(item => String(item.name || '') === targetName)
-      : null
+  return results
+}
 
-    if (!iface) {
-      return res.status(404).json({
-        ok: false,
-        error: 'interface_not_found',
-        message: `Interfaccia "${targetName}" non trovata`,
-        availableInterfaces: Array.isArray(interfaces)
-          ? interfaces.map(item => item.name).filter(Boolean)
-          : [],
-      })
+app.all('/v1/mikrotik/traffic/read', async (req, res) => {
+  try {
+    const body = req.body || {}
+
+    if (body.ip && body.user && body.pass && body.interfaceName) {
+      const traffic = await readMikrotikTraffic(body)
+      return res.json({ok: true, mode: 'single_read', ...traffic})
     }
 
-    const rxBytes = Number(iface['rx-byte'] ?? iface.rx_byte ?? iface.rxBytes ?? 0)
-    const txBytes = Number(iface['tx-byte'] ?? iface.tx_byte ?? iface.txBytes ?? 0)
-
-    if (!Number.isFinite(rxBytes) || !Number.isFinite(txBytes)) {
-      return res.status(502).json({
-        ok: false,
-        error: 'traffic_counters_missing',
-        message: 'Contatori rx-byte/tx-byte non disponibili nella risposta MikroTik',
-        raw: iface,
-      })
-    }
+    const results = await collectMikrotikTraffic()
 
     return res.json({
       ok: true,
-      via: 'routeros_rest',
-      interface_name: targetName,
-      rx_bytes: rxBytes,
-      tx_bytes: txBytes,
-      total_bytes: rxBytes + txBytes,
-      logged_at: new Date().toISOString(),
-      raw: iface,
+      mode: 'collect_and_log',
+      total: results.length,
+      success: results.filter(r => r.ok).length,
+      failed: results.filter(r => !r.ok).length,
+      results,
     })
   } catch (e) {
     return res.status(500).json({
       ok: false,
-      error: 'mikrotik_traffic_read_error',
+      error: 'mikrotik_traffic_error',
       message: e?.message || String(e),
     })
   }
