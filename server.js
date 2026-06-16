@@ -1933,6 +1933,108 @@ app.post('/v1/webcams/:id/maintenance/reboot/read', async (req, res) => {
   }
 })
 
+app.post('/v1/mikrotik/traffic/read', async (req, res) => {
+  try {
+    const {
+      ip,
+      port = 80,
+      user,
+      pass,
+      interfaceName,
+      timeoutMs = 8000,
+      protocol = 'http',
+    } = req.body || {}
+
+    if (!ip || !user || !pass || !interfaceName) {
+      return res.status(400).json({
+        ok: false,
+        error: 'bad_request',
+        message: 'ip,user,pass,interfaceName obbligatori',
+      })
+    }
+
+    const scheme = String(protocol).toLowerCase() === 'https' ? 'https' : 'http'
+    const base = normalizeBaseUrl(`${scheme}://${String(ip)}`, port)
+
+    const interfacesUrl = `${base}/rest/interface`
+    const r = await fetchWithBasicOrDigest(interfacesUrl, {
+      method: 'GET',
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: Number(timeoutMs) || 8000,
+      headers: {Accept: 'application/json'},
+    })
+
+    const text = await r.text().catch(() => '')
+
+    if (!r.ok) {
+      return res.status(502).json({
+        ok: false,
+        error: 'mikrotik_rest_failed',
+        status: r.status,
+        detail: text.slice(0, 500),
+      })
+    }
+
+    let interfaces
+    try {
+      interfaces = JSON.parse(text)
+    } catch (_) {
+      return res.status(502).json({
+        ok: false,
+        error: 'invalid_json',
+        message: 'Risposta MikroTik REST non JSON',
+        detail: text.slice(0, 500),
+      })
+    }
+
+    const targetName = String(interfaceName).trim()
+    const iface = Array.isArray(interfaces)
+      ? interfaces.find(item => String(item.name || '') === targetName)
+      : null
+
+    if (!iface) {
+      return res.status(404).json({
+        ok: false,
+        error: 'interface_not_found',
+        message: `Interfaccia "${targetName}" non trovata`,
+        availableInterfaces: Array.isArray(interfaces)
+          ? interfaces.map(item => item.name).filter(Boolean)
+          : [],
+      })
+    }
+
+    const rxBytes = Number(iface['rx-byte'] ?? iface.rx_byte ?? iface.rxBytes ?? 0)
+    const txBytes = Number(iface['tx-byte'] ?? iface.tx_byte ?? iface.txBytes ?? 0)
+
+    if (!Number.isFinite(rxBytes) || !Number.isFinite(txBytes)) {
+      return res.status(502).json({
+        ok: false,
+        error: 'traffic_counters_missing',
+        message: 'Contatori rx-byte/tx-byte non disponibili nella risposta MikroTik',
+        raw: iface,
+      })
+    }
+
+    return res.json({
+      ok: true,
+      via: 'routeros_rest',
+      interface_name: targetName,
+      rx_bytes: rxBytes,
+      tx_bytes: txBytes,
+      total_bytes: rxBytes + txBytes,
+      logged_at: new Date().toISOString(),
+      raw: iface,
+    })
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: 'mikrotik_traffic_read_error',
+      message: e?.message || String(e),
+    })
+  }
+})
+
 /* ────────────────────────────────────────────── */
 process.on('SIGTERM', () => {
   console.log('[PROC] SIGTERM received - shutting down')
