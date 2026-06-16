@@ -2003,33 +2003,65 @@ async function readMikrotikTraffic({ip, port = 80, user, pass, interfaceName, pr
   }
 }
 
-async function loadTrafficLimits() {
+async function loadMikrotikAccesses() {
   const result = await fetchHasura(/* GraphQL */ `
-    query TrafficLimits {
-      mikrotik_traffic_limits(where: {enabled: {_eq: true}}) {
-        id
-        webcam_access_id
-        interface_name
-        monthly_limit_gb
-        reset_day
-        timezone
-        warning_threshold_1
-        warning_threshold_2
-        warning_threshold_3
-        webcam_access {
-          id
-          mikrotik_vpn_ip
-          mikrotik_user
-          mikrotik_password
+    query MikrotikAccesses {
+      webcam_access(
+        where: {
+          mikrotik_vpn_ip: {_is_null: false}
+          mikrotik_user: {_is_null: false}
+          mikrotik_password: {_is_null: false}
         }
+      ) {
+        id
+        mikrotik_vpn_ip
+        mikrotik_user
+        mikrotik_password
       }
     }
   `)
 
-  return result?.data?.mikrotik_traffic_limits || []
+  return result?.data?.webcam_access || []
 }
 
-async function insertTrafficLog({limit, traffic}) {
+async function loadTrafficLimitsByAccessIds(webcamAccessIds) {
+  if (!webcamAccessIds.length) return {}
+
+  const result = await fetchHasura(
+    /* GraphQL */ `
+      query TrafficLimits($webcamAccessIds: [uuid!]!) {
+        mikrotik_traffic_limits(
+          where: {webcam_access_id: {_in: $webcamAccessIds}}
+          order_by: {date_created: desc}
+        ) {
+          id
+          webcam_access_id
+          enabled
+          interface_name
+          monthly_limit_gb
+          reset_day
+          timezone
+          warning_threshold_1
+          warning_threshold_2
+          warning_threshold_3
+        }
+      }
+    `,
+    {webcamAccessIds}
+  )
+
+  const rows = result?.data?.mikrotik_traffic_limits || []
+
+  return rows.reduce((acc, limit) => {
+    if (!acc[limit.webcam_access_id]) {
+      acc[limit.webcam_access_id] = limit
+    }
+
+    return acc
+  }, {})
+}
+
+async function insertTrafficLog({access, limit, traffic}) {
   const result = await fetchHasura(
     /* GraphQL */ `
       mutation InsertTrafficLog($object: mikrotik_traffic_logs_insert_input!) {
@@ -2041,13 +2073,16 @@ async function insertTrafficLog({limit, traffic}) {
     `,
     {
       object: {
-        webcam_access_id: limit.webcam_access_id,
+        webcam_access_id: access.id,
         interface_name: traffic.interface_name,
         rx_bytes: String(traffic.rx_bytes),
         tx_bytes: String(traffic.tx_bytes),
         total_bytes: String(traffic.total_bytes),
         logged_at: new Date().toISOString(),
-        meta: traffic.raw,
+        meta: {
+          limit_id: limit?.id || null,
+          raw: traffic.raw,
+        },
       },
     }
   )
@@ -2056,13 +2091,16 @@ async function insertTrafficLog({limit, traffic}) {
 }
 
 async function collectMikrotikTraffic() {
-  const limits = await loadTrafficLimits()
+  const accesses = await loadMikrotikAccesses()
+  const accessIds = accesses.map(access => access.id)
+  const limitsByAccessId = await loadTrafficLimitsByAccessIds(accessIds)
+
   const results = []
 
-  for (const limit of limits) {
-    try {
-      const access = limit.webcam_access
+  for (const access of accesses) {
+    const limit = limitsByAccessId[access.id] || null
 
+    try {
       if (!access?.mikrotik_vpn_ip || !access?.mikrotik_user || !access?.mikrotik_password) {
         throw new Error('Dati MikroTik mancanti su webcam_access')
       }
@@ -2072,16 +2110,17 @@ async function collectMikrotikTraffic() {
         port: Number(process.env.MIKROTIK_REST_PORT || 80),
         user: access.mikrotik_user,
         pass: access.mikrotik_password,
-        interfaceName: limit.interface_name || 'lte1',
+        interfaceName: limit?.interface_name || process.env.MIKROTIK_DEFAULT_INTERFACE || 'lte1',
         protocol: process.env.MIKROTIK_REST_PROTOCOL || 'http',
       })
 
-      const log = await insertTrafficLog({limit, traffic})
+      const log = await insertTrafficLog({access, limit, traffic})
 
       results.push({
         ok: true,
-        limit_id: limit.id,
-        webcam_access_id: limit.webcam_access_id,
+        webcam_access_id: access.id,
+        limit_id: limit?.id || null,
+        has_limit_config: !!limit,
         interface_name: traffic.interface_name,
         rx_bytes: traffic.rx_bytes,
         tx_bytes: traffic.tx_bytes,
@@ -2091,8 +2130,9 @@ async function collectMikrotikTraffic() {
     } catch (e) {
       results.push({
         ok: false,
-        limit_id: limit.id,
-        webcam_access_id: limit.webcam_access_id,
+        webcam_access_id: access.id,
+        limit_id: limit?.id || null,
+        has_limit_config: !!limit,
         error: e?.message || String(e),
       })
     }
