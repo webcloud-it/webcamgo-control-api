@@ -2078,10 +2078,6 @@ async function insertTrafficLog({access, limit, traffic}) {
         rx_bytes: String(traffic.rx_bytes),
         tx_bytes: String(traffic.tx_bytes),
         logged_at: new Date().toISOString(),
-        meta: {
-          limit_id: limit?.id || null,
-          raw: traffic.raw,
-        },
       },
     }
   )
