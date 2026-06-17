@@ -2146,6 +2146,20 @@ app.all('/v1/mikrotik/traffic/read', async (req, res) => {
 
     if (body.ip && body.user && body.pass && body.interfaceName) {
       const traffic = await readMikrotikTraffic(body)
+
+      if (body.webcamAccessId) {
+        const access = {id: String(body.webcamAccessId)}
+        const limit = body.limitId ? {id: String(body.limitId)} : null
+        const log = await insertTrafficLog({access, limit, traffic})
+
+        return res.json({
+          ok: true,
+          mode: 'single_read_and_log',
+          ...traffic,
+          log_id: log?.id || null,
+        })
+      }
+
       return res.json({ok: true, mode: 'single_read', ...traffic})
     }
 
