@@ -2110,7 +2110,7 @@ async function collectMikrotikTraffic() {
         port: Number(process.env.MIKROTIK_REST_PORT || 80),
         user: access.mikrotik_user,
         pass: access.mikrotik_password,
-        interfaceName: limit?.interface_name || process.env.MIKROTIK_DEFAULT_INTERFACE || 'lte1',
+        interfaceName: limit?.interface_name || process.env.MIKROTIK_DEFAULT_INTERFACE || 'ether1',
         protocol: process.env.MIKROTIK_REST_PROTOCOL || 'http',
       })
 
