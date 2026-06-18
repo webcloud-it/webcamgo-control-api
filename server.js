@@ -1347,78 +1347,123 @@ app.post('/v1/webcams/:id/onvif/device-info', async (req, res) => {
  * SNAPSHOT (realtime)
  * ────────────────────────────────────────────── */
 app.get('/v1/webcams/:id/snapshot', async (req, res) => {
+  const attempts = []
+
   try {
-    const {url, ip, port, user, pass} = req.query
+    const {url, ip, port = 80, user, pass} = req.query
 
-    // Se arriva un URL esplicito, usiamo quello
-    let snapshotUrl = url ? String(url) : null
+    if (!url && (!ip || !user || !pass)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'bad_request',
+        message: 'Richiesti: url oppure (ip,user,pass).',
+      })
+    }
 
-    // Altrimenti proviamo ONVIF per ottenere snapshotUri
-    if (!snapshotUrl) {
-      if (!ip || !user || !pass) {
-        return res.status(400).json({
+    const urlsToTry = []
+
+    if (url) {
+      urlsToTry.push({via: 'explicit_url', url: String(url)})
+    } else {
+      try {
+        const cam = await connectOnvif({
+          ip: String(ip),
+          port: +port,
+          user: String(user),
+          pass: String(pass),
+          timeoutMs: 7000,
+        })
+
+        const uri = await new Promise((resolve, reject) =>
+          cam.getSnapshotUri((err, data) =>
+            err ? reject(err) : resolve(data?.uri || data?.Uri || null)
+          )
+        )
+
+        if (uri) {
+          urlsToTry.push({via: 'onvif_snapshot_uri', url: String(uri)})
+        } else {
+          attempts.push({via: 'onvif_snapshot_uri', ok: false, error: 'URI snapshot non ricevuta'})
+        }
+      } catch (e) {
+        attempts.push({
+          via: 'onvif_snapshot_uri',
           ok: false,
-          error: 'bad_request',
-          message: 'Richiesti: url oppure (ip,user,pass).',
+          error: e?.message || String(e),
         })
       }
 
-      const cam = await connectOnvif({
-        ip: String(ip),
-        port: port ? +port : 80,
-        user: String(user),
-        pass: String(pass),
+      const base = normalizeBaseUrl(String(ip), port)
+      urlsToTry.push({
+        via: 'dahua_cgi_snapshot',
+        url: `${base}/cgi-bin/snapshot.cgi?channel=1`,
       })
-      const uri = await new Promise((resolve, reject) =>
-        cam.getSnapshotUri((err, data) =>
-          err ? reject(err) : resolve(data?.uri || data?.Uri || null)
+    }
+
+    for (const candidate of urlsToTry) {
+      try {
+        const u = new URL(
+          /^https?:\/\//i.test(candidate.url) ? candidate.url : `http://${candidate.url}`
         )
-      )
-      if (!uri) throw new Error('URI snapshot non ricevuta via ONVIF')
-      snapshotUrl = String(uri)
+        u.searchParams.set('_ts', Date.now().toString())
+
+        const r = await fetchWithBasicOrDigest(u.toString(), {
+          method: 'GET',
+          user: user ? String(user) : undefined,
+          pass: pass ? String(pass) : undefined,
+          timeoutMs: 10000,
+          headers: {
+            'Accept': 'image/jpeg,image/png,image/*,*/*',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+          },
+        })
+
+        const ct = r.headers.get('content-type') || ''
+
+        if (!r.ok) {
+          const text = await r.text().catch(() => '')
+          attempts.push({
+            via: candidate.via,
+            ok: false,
+            status: r.status,
+            detail: text?.slice(0, 300) || r.statusText,
+          })
+          continue
+        }
+
+        const buf = Buffer.from(await r.arrayBuffer())
+
+        if (!buf.length) {
+          attempts.push({via: candidate.via, ok: false, error: 'Risposta immagine vuota'})
+          continue
+        }
+
+        res.setHeader('Content-Type', /image\//i.test(ct) ? ct : 'image/jpeg')
+        res.setHeader('Cache-Control', 'no-store')
+        res.setHeader('X-WebcamGo-Snapshot-Via', candidate.via)
+        return res.status(200).send(buf)
+      } catch (e) {
+        attempts.push({
+          via: candidate.via,
+          ok: false,
+          error: e?.message || String(e),
+        })
+      }
     }
 
-    // Cache-buster per “realtime”
-    const u = new URL(/^https?:\/\//i.test(snapshotUrl) ? snapshotUrl : `http://${snapshotUrl}`)
-    u.searchParams.set('_ts', Date.now().toString())
-    const cacheBusted = u.toString()
-
-    const r = await fetchWithBasicOrDigest(cacheBusted, {
-      method: 'GET',
-      user: user ? String(user) : undefined,
-      pass: pass ? String(pass) : undefined,
-      timeoutMs: 10000,
-      headers: {
-        'Accept': 'image/jpeg',
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Pragma': 'no-cache',
-      },
+    return res.status(502).json({
+      ok: false,
+      error: 'snapshot_failed',
+      message: 'Nessun metodo snapshot disponibile',
+      attempts,
     })
-
-    if (!r.ok) {
-      const text = await r.text().catch(() => '')
-      return res.status(502).json({
-        ok: false,
-        error: 'snapshot_failed',
-        status: r.status,
-        detail: text?.slice(0, 300) || r.statusText,
-      })
-    }
-
-    const ct = r.headers.get('content-type') || ''
-    if (!/image\/jpeg/i.test(ct) && !/image\//i.test(ct)) {
-      // alcune cam non mettono content-type: proviamo comunque
-    }
-
-    res.setHeader('Content-Type', 'image/jpeg')
-    res.setHeader('Cache-Control', 'no-store')
-    const buf = Buffer.from(await r.arrayBuffer())
-    return res.status(200).send(buf)
   } catch (e) {
     return res.status(500).json({
       ok: false,
       error: 'snapshot_error',
       message: e?.message || String(e),
+      attempts,
     })
   }
 })
