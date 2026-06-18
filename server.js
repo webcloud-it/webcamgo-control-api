@@ -6,6 +6,7 @@ const crypto = require('crypto')
 const {Cam} = require('onvif')
 const {fetch} = require('undici')
 const net = require('net')
+const sharp = require('sharp')
 
 const app = express()
 app.set('trust proxy', 1)
@@ -1589,6 +1590,19 @@ app.post('/v1/webcams/:id/snapshot/force-masked', async (req, res) => {
     }
 
     const rawBuf = Buffer.from(await rawRes.arrayBuffer())
+
+    const metadata = await sharp(rawBuf).metadata()
+    const width = metadata.width
+    const height = metadata.height
+
+    if (!width || !height) {
+      return res.status(500).json({
+        ok: false,
+        error: 'image_metadata_error',
+        message: 'Impossibile leggere le dimensioni dello snapshot',
+      })
+    }
+
     const imageBase64 = rawBuf.toString('base64')
 
     // 2) chiama leash /render
@@ -1597,8 +1611,6 @@ app.post('/v1/webcams/:id/snapshot/force-masked', async (req, res) => {
       return res.status(500).json({ok: false, error: 'misconfig', message: 'LEASH_TOKEN mancante'})
     }
 
-    const width = 1920
-    const height = 1080
     const datetime = new Date().toISOString()
 
     const leashRes = await fetch(`https://leash.cloud.webcamgo.com/render`, {
