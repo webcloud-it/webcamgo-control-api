@@ -2016,7 +2016,115 @@ async function fetchHasura(query, variables = {}) {
   return json
 }
 
-async function readMikrotikTraffic({ip, port = 80, user, pass, interfaceName, protocol = 'http'}) {
+function parseMaybeJson(value) {
+  if (value == null || value === '') return null
+
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value)
+    } catch (_) {
+      return value
+    }
+  }
+
+  return value
+}
+
+function normalizeMikrotikInterfaceConfigs({
+  interfaces,
+  interfaceNames,
+  interfaceName,
+  fallbackInterfaceName,
+}) {
+  const rawInterfaces = parseMaybeJson(interfaces)
+  const rawInterfaceNames = parseMaybeJson(interfaceNames)
+
+  const hasConfiguredInterfaces = Array.isArray(rawInterfaces) && rawInterfaces.length > 0
+  const hasConfiguredInterfaceNames =
+    Array.isArray(rawInterfaceNames) && rawInterfaceNames.length > 0
+
+  let rows = []
+
+  if (hasConfiguredInterfaces) {
+    rows = rawInterfaces
+  } else if (hasConfiguredInterfaceNames) {
+    rows = rawInterfaceNames
+  } else if (interfaceName) {
+    rows = [interfaceName]
+  } else if (fallbackInterfaceName) {
+    rows = [fallbackInterfaceName]
+  }
+
+  const normalized = rows
+    .map(item => {
+      if (typeof item === 'string') {
+        const name = item.trim()
+        if (!name) return null
+
+        return {
+          name,
+          label: name,
+          enabled: true,
+          count_in_quota: true,
+        }
+      }
+
+      if (!item || typeof item !== 'object') return null
+
+      const name = String(item.name || item.interface_name || item.value || '').trim()
+      if (!name) return null
+
+      return {
+        name,
+        label: String(item.label || item.name || name).trim(),
+        enabled: item.enabled !== false && item.enabled !== 'false',
+        count_in_quota: item.count_in_quota !== false && item.count_in_quota !== 'false',
+      }
+    })
+    .filter(item => item?.name && item.enabled)
+
+  const unique = []
+  const seen = new Set()
+
+  for (const item of normalized) {
+    if (seen.has(item.name)) continue
+    seen.add(item.name)
+    unique.push(item)
+  }
+
+  // Se l'utente ha configurato interfacce ma sono tutte disattivate/non valide,
+  // non forziamo ether1: lasciamo lista vuota.
+  if (!unique.length && (hasConfiguredInterfaces || hasConfiguredInterfaceNames)) {
+    return []
+  }
+
+  if (!unique.length) {
+    const fallback = String(
+      fallbackInterfaceName || process.env.MIKROTIK_DEFAULT_INTERFACE || 'ether1'
+    ).trim()
+
+    if (fallback) {
+      unique.push({
+        name: fallback,
+        label: fallback,
+        enabled: true,
+        count_in_quota: true,
+      })
+    }
+  }
+
+  return unique
+}
+
+function getLimitInterfaceConfigs(limit) {
+  return normalizeMikrotikInterfaceConfigs({
+    interfaces: limit?.interfaces,
+    interfaceName: limit?.interface_name,
+    fallbackInterfaceName: process.env.MIKROTIK_DEFAULT_INTERFACE || 'ether1',
+  })
+}
+
+async function fetchMikrotikInterfaces({ip, port = 80, user, pass, protocol = 'http'}) {
   const scheme = String(protocol).toLowerCase() === 'https' ? 'https' : 'http'
   const base = normalizeBaseUrl(`${scheme}://${String(ip)}`, port)
   const url = `${base}/rest/interface`
@@ -2035,29 +2143,94 @@ async function readMikrotikTraffic({ip, port = 80, user, pass, interfaceName, pr
     throw new Error(`MikroTik REST HTTP ${r.status}: ${text.slice(0, 300)}`)
   }
 
-  const interfaces = JSON.parse(text)
-  const iface = Array.isArray(interfaces)
-    ? interfaces.find(item => String(item.name || '') === String(interfaceName))
-    : null
+  const rows = JSON.parse(text)
 
-  if (!iface) {
-    throw new Error(`Interfaccia "${interfaceName}" non trovata`)
+  if (!Array.isArray(rows)) {
+    throw new Error('Risposta MikroTik REST non valida')
   }
 
+  return rows
+}
+
+function parseMikrotikTrafficInterface({iface, config}) {
   const rxBytes = Number(iface['rx-byte'] ?? iface.rx_byte ?? 0)
   const txBytes = Number(iface['tx-byte'] ?? iface.tx_byte ?? 0)
 
   if (!Number.isFinite(rxBytes) || !Number.isFinite(txBytes)) {
-    throw new Error('Contatori rx-byte/tx-byte non disponibili')
+    throw new Error(`Contatori rx-byte/tx-byte non disponibili per "${config.name}"`)
   }
 
   return {
-    interface_name: String(interfaceName),
+    interface_name: config.name,
+    interface_label: config.label || config.name,
+    count_in_quota: config.count_in_quota !== false,
     rx_bytes: rxBytes,
     tx_bytes: txBytes,
     total_bytes: rxBytes + txBytes,
     raw: iface,
   }
+}
+
+async function readMikrotikTrafficInterfaces({
+  ip,
+  port = 80,
+  user,
+  pass,
+  protocol = 'http',
+  interfaces,
+  interfaceNames,
+  interfaceName,
+}) {
+  const configs = normalizeMikrotikInterfaceConfigs({
+    interfaces,
+    interfaceNames,
+    interfaceName,
+    fallbackInterfaceName: interfaceName || process.env.MIKROTIK_DEFAULT_INTERFACE || 'ether1',
+  })
+
+  const rows = await fetchMikrotikInterfaces({ip, port, user, pass, protocol})
+  const traffic = []
+  const errors = []
+
+  for (const config of configs) {
+    const iface = rows.find(item => String(item.name || '') === String(config.name))
+
+    if (!iface) {
+      errors.push({
+        interface_name: config.name,
+        error: `Interfaccia "${config.name}" non trovata`,
+      })
+      continue
+    }
+
+    try {
+      traffic.push(parseMikrotikTrafficInterface({iface, config}))
+    } catch (e) {
+      errors.push({
+        interface_name: config.name,
+        error: e?.message || String(e),
+      })
+    }
+  }
+
+  if (!traffic.length) {
+    throw new Error(errors.map(item => item.error).join('; ') || 'Nessuna interfaccia leggibile')
+  }
+
+  return {traffic, errors}
+}
+
+async function readMikrotikTraffic({ip, port = 80, user, pass, interfaceName, protocol = 'http'}) {
+  const result = await readMikrotikTrafficInterfaces({
+    ip,
+    port,
+    user,
+    pass,
+    protocol,
+    interfaceName,
+  })
+
+  return result.traffic[0]
 }
 
 async function loadMikrotikAccesses() {
@@ -2095,6 +2268,7 @@ async function loadTrafficLimitsByAccessIds(webcamAccessIds) {
           webcam_access_id
           enabled
           interface_name
+          interfaces
           monthly_limit_gb
           reset_day
           timezone
@@ -2153,32 +2327,73 @@ async function collectMikrotikTraffic() {
     const limit = limitsByAccessId[access.id] || null
 
     try {
+      if (limit && limit.enabled === false) {
+        results.push({
+          ok: true,
+          skipped: true,
+          webcam_access_id: access.id,
+          limit_id: limit.id || null,
+          has_limit_config: true,
+          reason: 'monitoraggio_disattivato',
+        })
+        continue
+      }
+
       if (!access?.mikrotik_vpn_ip || !access?.mikrotik_user || !access?.mikrotik_password) {
         throw new Error('Dati MikroTik mancanti su webcam_access')
       }
 
-      const traffic = await readMikrotikTraffic({
+      const interfaceConfigs = getLimitInterfaceConfigs(limit)
+
+      if (!interfaceConfigs.length) {
+        results.push({
+          ok: true,
+          skipped: true,
+          webcam_access_id: access.id,
+          limit_id: limit?.id || null,
+          has_limit_config: !!limit,
+          reason: 'nessuna_interfaccia_attiva',
+        })
+        continue
+      }
+
+      const {traffic, errors} = await readMikrotikTrafficInterfaces({
         ip: access.mikrotik_vpn_ip,
         port: Number(process.env.MIKROTIK_REST_PORT || 80),
         user: access.mikrotik_user,
         pass: access.mikrotik_password,
-        interfaceName: limit?.interface_name || process.env.MIKROTIK_DEFAULT_INTERFACE || 'ether1',
+        interfaces: interfaceConfigs,
         protocol: process.env.MIKROTIK_REST_PROTOCOL || 'http',
       })
 
-      const log = await insertTrafficLog({access, limit, traffic})
+      for (const item of traffic) {
+        const log = await insertTrafficLog({access, limit, traffic: item})
 
-      results.push({
-        ok: true,
-        webcam_access_id: access.id,
-        limit_id: limit?.id || null,
-        has_limit_config: !!limit,
-        interface_name: traffic.interface_name,
-        rx_bytes: traffic.rx_bytes,
-        tx_bytes: traffic.tx_bytes,
-        total_bytes: traffic.total_bytes,
-        log_id: log?.id || null,
-      })
+        results.push({
+          ok: true,
+          webcam_access_id: access.id,
+          limit_id: limit?.id || null,
+          has_limit_config: !!limit,
+          interface_name: item.interface_name,
+          interface_label: item.interface_label,
+          count_in_quota: item.count_in_quota,
+          rx_bytes: item.rx_bytes,
+          tx_bytes: item.tx_bytes,
+          total_bytes: item.total_bytes,
+          log_id: log?.id || null,
+        })
+      }
+
+      for (const error of errors) {
+        results.push({
+          ok: false,
+          webcam_access_id: access.id,
+          limit_id: limit?.id || null,
+          has_limit_config: !!limit,
+          interface_name: error.interface_name,
+          error: error.error,
+        })
+      }
     } catch (e) {
       results.push({
         ok: false,
@@ -2196,24 +2411,50 @@ async function collectMikrotikTraffic() {
 app.all('/v1/mikrotik/traffic/read', async (req, res) => {
   try {
     const body = req.body || {}
+    const hasSingleInterface = !!body.interfaceName
+    const hasMultipleInterfaces =
+      Array.isArray(body.interfaces) ||
+      Array.isArray(body.interfaceNames) ||
+      (typeof body.interfaces === 'string' && body.interfaces.trim()) ||
+      (typeof body.interfaceNames === 'string' && body.interfaceNames.trim())
 
-    if (body.ip && body.user && body.pass && body.interfaceName) {
-      const traffic = await readMikrotikTraffic(body)
+    if (body.ip && body.user && body.pass && (hasSingleInterface || hasMultipleInterfaces)) {
+      const {traffic, errors} = await readMikrotikTrafficInterfaces(body)
+      const logs = []
 
       if (body.webcamAccessId) {
         const access = {id: String(body.webcamAccessId)}
         const limit = body.limitId ? {id: String(body.limitId)} : null
-        const log = await insertTrafficLog({access, limit, traffic})
 
+        for (const item of traffic) {
+          const log = await insertTrafficLog({access, limit, traffic: item})
+          logs.push({
+            interface_name: item.interface_name,
+            log_id: log?.id || null,
+          })
+        }
+      }
+
+      if (hasSingleInterface && !hasMultipleInterfaces) {
         return res.json({
           ok: true,
-          mode: 'single_read_and_log',
-          ...traffic,
-          log_id: log?.id || null,
+          mode: body.webcamAccessId ? 'single_read_and_log' : 'single_read',
+          ...traffic[0],
+          log_id: logs[0]?.log_id || null,
+          errors,
         })
       }
 
-      return res.json({ok: true, mode: 'single_read', ...traffic})
+      return res.json({
+        ok: true,
+        mode: body.webcamAccessId ? 'multi_read_and_log' : 'multi_read',
+        total: traffic.length + errors.length,
+        success: traffic.length,
+        failed: errors.length,
+        interfaces: traffic,
+        logs,
+        errors,
+      })
     }
 
     const results = await collectMikrotikTraffic()
@@ -2222,7 +2463,8 @@ app.all('/v1/mikrotik/traffic/read', async (req, res) => {
       ok: true,
       mode: 'collect_and_log',
       total: results.length,
-      success: results.filter(r => r.ok).length,
+      success: results.filter(r => r.ok && !r.skipped).length,
+      skipped: results.filter(r => r.skipped).length,
       failed: results.filter(r => !r.ok).length,
       results,
     })
