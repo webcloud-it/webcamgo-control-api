@@ -2477,6 +2477,59 @@ app.all('/v1/mikrotik/traffic/read', async (req, res) => {
   }
 })
 
+app.post('/v1/mikrotik/reboot', async (req, res) => {
+  try {
+    const {ip, user, pass} = req.body || {}
+
+    if (!ip || !user || !pass) {
+      return res.status(400).json({
+        ok: false,
+        error: 'bad_request',
+        message: 'ip,user,pass obbligatori',
+      })
+    }
+
+    const protocol = process.env.MIKROTIK_REST_PROTOCOL || 'http'
+    const port = Number(process.env.MIKROTIK_REST_PORT || 80)
+
+    const base = normalizeBaseUrl(`${protocol}://${ip}`, port)
+
+    const r = await fetchWithBasicOrDigest(`${base}/rest/system/reboot`, {
+      method: 'POST',
+      user,
+      pass,
+      timeoutMs: 8000,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: '{}',
+    })
+
+    const text = await r.text().catch(() => '')
+
+    if (!r.ok) {
+      return res.status(502).json({
+        ok: false,
+        error: 'mikrotik_reboot_failed',
+        status: r.status,
+        detail: text.slice(0, 300),
+      })
+    }
+
+    return res.json({
+      ok: true,
+      message: 'Comando di riavvio MikroTik inviato',
+    })
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: 'mikrotik_reboot_error',
+      message: e?.message || String(e),
+    })
+  }
+})
+
 /* ────────────────────────────────────────────── */
 process.on('SIGTERM', () => {
   console.log('[PROC] SIGTERM received - shutting down')
