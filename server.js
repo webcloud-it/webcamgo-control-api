@@ -2491,36 +2491,93 @@ app.post('/v1/mikrotik/reboot', async (req, res) => {
 
     const protocol = process.env.MIKROTIK_REST_PROTOCOL || 'http'
     const port = Number(process.env.MIKROTIK_REST_PORT || 80)
-
     const base = normalizeBaseUrl(`${protocol}://${ip}`, port)
 
-    const r = await fetchWithBasicOrDigest(`${base}/rest/system/reboot`, {
-      method: 'POST',
-      user,
-      pass,
-      timeoutMs: 8000,
+    /*
+     * Prima verifichiamo che il MikroTik sia realmente raggiungibile
+     * e che le credenziali REST siano valide.
+     *
+     * Questo ci permette poi di considerare normale la perdita della
+     * connessione durante il comando di reboot.
+     */
+    const check = await fetchWithBasicOrDigest(`${base}/rest/system/resource`, {
+      method: 'GET',
+      user: String(user),
+      pass: String(pass),
+      timeoutMs: 4000,
       headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
+        Accept: 'application/json',
       },
-      body: '{}',
     })
 
-    const text = await r.text().catch(() => '')
+    if (!check.ok) {
+      const text = await check.text().catch(() => '')
 
-    if (!r.ok) {
       return res.status(502).json({
         ok: false,
-        error: 'mikrotik_reboot_failed',
-        status: r.status,
+        error: 'mikrotik_unreachable',
+        status: check.status,
         detail: text.slice(0, 300),
       })
     }
 
-    return res.json({
-      ok: true,
-      message: 'Comando di riavvio MikroTik inviato',
-    })
+    /*
+     * Il reboot può interrompere la connessione prima che RouterOS
+     * restituisca la risposta HTTP.
+     */
+    try {
+      const reboot = await fetchWithBasicOrDigest(`${base}/rest/system/reboot`, {
+        method: 'POST',
+        user: String(user),
+        pass: String(pass),
+        timeoutMs: 3000,
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: '{}',
+      })
+
+      if (!reboot.ok) {
+        const text = await reboot.text().catch(() => '')
+
+        return res.status(502).json({
+          ok: false,
+          error: 'mikrotik_reboot_failed',
+          status: reboot.status,
+          detail: text.slice(0, 300),
+        })
+      }
+
+      return res.json({
+        ok: true,
+        message: 'Comando di riavvio MikroTik inviato',
+        confirmed: true,
+      })
+    } catch (e) {
+      /*
+       * Il router era raggiungibile immediatamente prima.
+       * Durante il reboot è normale che chiuda la connessione REST
+       * senza inviare una risposta HTTP completa.
+       */
+      const msg = String(e?.message || e).toLowerCase()
+
+      if (
+        msg.includes('timeout') ||
+        msg.includes('abort') ||
+        msg.includes('socket') ||
+        msg.includes('econnreset')
+      ) {
+        return res.status(202).json({
+          ok: true,
+          message: 'Comando di riavvio MikroTik inviato',
+          confirmed: false,
+          connection_closed: true,
+        })
+      }
+
+      throw e
+    }
   } catch (e) {
     return res.status(500).json({
       ok: false,
